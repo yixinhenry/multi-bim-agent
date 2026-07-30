@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+viewer/dist/
+viewer/node_modules/
+*.pyc
+*.frag
+*.frag.tmp
+
