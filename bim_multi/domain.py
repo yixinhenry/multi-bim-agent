@@ -4,12 +4,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 
-class Discipline(StrEnum):
-    ARC = "ARC"
-    STR = "STR"
-    MEP = "MEP"
-
-
 class Identity(StrEnum):
     CLIENT = "CLIENT"
     PROJECT_MANAGER = "PROJECT_MANAGER"
@@ -32,7 +26,6 @@ class IdentityProfile:
     agent_id: str
     declared_role: str
     expected_files: frozenset[str]
-    model_disciplines: tuple[Discipline, ...]
 
 
 PROFILES = {
@@ -42,7 +35,6 @@ PROFILES = {
         "project-manager-agent",
         "Client-facing Project Manager Agent",
         frozenset({"ARC.ifc", "STR.ifc", "MEP.ifc"}),
-        tuple(Discipline),
     ),
     Identity.PROJECT_MANAGER: IdentityProfile(
         Identity.PROJECT_MANAGER,
@@ -50,7 +42,6 @@ PROFILES = {
         "project-manager-agent",
         "Project Manager Agent",
         frozenset({"ARC.ifc", "STR.ifc", "MEP.ifc"}),
-        tuple(Discipline),
     ),
     Identity.ARC: IdentityProfile(
         Identity.ARC,
@@ -58,7 +49,6 @@ PROFILES = {
         "arc-agent",
         "ARC Agent",
         frozenset({"ARC.ifc"}),
-        (Discipline.ARC,),
     ),
     Identity.STR: IdentityProfile(
         Identity.STR,
@@ -66,7 +56,6 @@ PROFILES = {
         "str-agent",
         "STR Agent",
         frozenset({"STR.ifc"}),
-        (Discipline.STR,),
     ),
     Identity.MEP: IdentityProfile(
         Identity.MEP,
@@ -74,7 +63,6 @@ PROFILES = {
         "mep-agent",
         "MEP Agent",
         frozenset({"MEP.ifc"}),
-        (Discipline.MEP,),
     ),
 }
 

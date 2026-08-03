@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from itertools import combinations
 from pathlib import Path
 
 import streamlit as st
@@ -233,20 +234,32 @@ def render_sidebar(project_id: int | None) -> Identity:
         st.session_state.pop("viewer_clash", None)
     st.session_state["_active_identity"] = identity.value
     st.sidebar.markdown(
-        f'<div class="identity-card"><strong>{PROFILES[identity].declared_role}</strong>'
+        f'<div class="identity-card"><strong>{PROFILES[identity].label}</strong>'
+        f'<div class="muted">Agent: {PROFILES[Identity.PROJECT_MANAGER].declared_role}</div>'
         f'<div class="muted">Conversation: {project_id}:{identity.value}:main</div></div>',
         unsafe_allow_html=True,
     )
     return identity
 
 
-def model_query(project_id: int, identity: Identity) -> str:
-    files = storage.project_files(DB_PATH, project_id)
-    disciplines = [
-        discipline.value
-        for discipline in PROFILES[identity].model_disciplines
-        if discipline.value in files
+def model_choices(project_id: int, identity: Identity) -> list[tuple[str, ...]]:
+    available = [
+        kind
+        for kind in ("ARC", "STR", "MEP")
+        if kind in storage.project_files(DB_PATH, project_id)
     ]
+    choices = [
+        choice
+        for size in range(1, len(available) + 1)
+        for choice in combinations(available, size)
+    ]
+    if identity in {Identity.ARC, Identity.STR, Identity.MEP}:
+        choices = [choice for choice in choices if identity.value in choice]
+    return choices
+
+
+def model_query(project_id: int, disciplines: tuple[str, ...]) -> tuple[str, str]:
+    files = storage.project_files(DB_PATH, project_id)
     versions = []
     for kind in disciplines:
         path = Path(files[kind]["path"])
@@ -255,10 +268,30 @@ def model_query(project_id: int, identity: Identity) -> str:
 
 
 def render_viewer(project_id: int, identity: Identity) -> None:
-    kinds, version = model_query(project_id, identity)
-    if not kinds:
-        st.info("No IFC model is available for this identity. Upload one from Project files.")
+    choices = model_choices(project_id, identity)
+    if not choices:
+        st.info("No permitted IFC model combination is available. Upload this identity's model first.")
         return
+    selector_key = f"viewer-models-{project_id}-{identity.value}"
+    override = st.session_state.pop("viewer_model_override", None)
+    if (
+        override
+        and override["project_id"] == project_id
+        and override["identity"] == identity.value
+        and tuple(override["models"]) in choices
+    ):
+        st.session_state[selector_key] = tuple(override["models"])
+    if st.session_state.get(selector_key) not in choices:
+        st.session_state[selector_key] = choices[-1]
+    selected = st.selectbox(
+        "Models",
+        choices,
+        format_func=lambda choice: (
+            choice[0] if len(choice) == 1 else f"Federated: {' + '.join(choice)}"
+        ),
+        key=selector_key,
+    )
+    kinds, version = model_query(project_id, selected)
     url = viewer_url(str(DB_PATH))
     clash = st.session_state.get("viewer_clash")
     clash_query = ""
@@ -277,9 +310,7 @@ def render_viewer(project_id: int, identity: Identity) -> None:
         height=720,
     )
 
-def render_task_panel(project_id: int, identity: Identity) -> None:
-    if identity is not Identity.PROJECT_MANAGER:
-        return
+def render_task_panel(project_id: int) -> None:
     tasks = storage.list_tasks(DB_PATH, project_id, limit=20)
     with st.expander(f"Delegated tasks ({len(tasks)})"):
         if not tasks:
@@ -311,8 +342,6 @@ def render_task_panel(project_id: int, identity: Identity) -> None:
 
 
 def render_clash_issue_panel(project_id: int, identity: Identity) -> None:
-    if identity is not Identity.PROJECT_MANAGER:
-        return
     issues = storage.list_clash_issues(DB_PATH, project_id, limit=50)
     active = [issue for issue in issues if issue["status"] != "resolved"]
     with st.expander(f"Clash issues ({len(active)} active / {len(issues)} total)"):
@@ -347,14 +376,27 @@ def render_clash_issue_panel(project_id: int, identity: Identity) -> None:
                     "model_b": issue["model_b"],
                     "global_id_b": global_id_b,
                 }
+                required = {issue["model_a"], issue["model_b"]}
+                if identity in {Identity.ARC, Identity.STR, Identity.MEP}:
+                    required.add(identity.value)
+                st.session_state.viewer_model_override = {
+                    "project_id": project_id,
+                    "identity": identity.value,
+                    "models": [
+                        kind for kind in ("ARC", "STR", "MEP") if kind in required
+                    ],
+                }
                 st.rerun()
             st.divider()
+
+
 def render_chat(project_id: int, identity: Identity) -> None:
     profile = PROFILES[identity]
+    agent_profile = PROFILES[Identity.PROJECT_MANAGER]
     conversation_id = storage.ensure_conversation(DB_PATH, project_id, identity)
     st.subheader(profile.label)
-    st.caption(f"{profile.declared_role} · Isolated conversation")
-    render_task_panel(project_id, identity)
+    st.caption(f"{agent_profile.declared_role} · Isolated conversation")
+    render_task_panel(project_id)
     render_clash_issue_panel(project_id, identity)
     with st.container(height=500, border=True):
         messages = storage.list_messages(DB_PATH, conversation_id)
@@ -385,11 +427,11 @@ def render_chat(project_id: int, identity: Identity) -> None:
             DB_PATH, project_id, identity, SYSTEM_PROMPTS[identity]
         )
         with st.status(
-            f"{profile.declared_role} is working",
+            f"{agent_profile.declared_role} is working",
             expanded=True,
         ) as runtime_status:
             runtime_status.write(
-                f"**Agent:** {profile.declared_role} (`{profile.agent_id}`)"
+                f"**Agent:** {agent_profile.declared_role} (`{agent_profile.agent_id}`)"
             )
 
             event_queue: queue.Queue[tuple[str, str, dict]] = queue.Queue()
@@ -424,7 +466,7 @@ def render_chat(project_id: int, identity: Identity) -> None:
                 db_path=DB_PATH,
                 project_id=project_id,
                 conversation_id=conversation_id,
-                identity=identity,
+                identity=Identity.PROJECT_MANAGER,
                 input_message=prompt,
                 event_callback=enqueue_runtime_event,
             )
@@ -432,14 +474,22 @@ def render_chat(project_id: int, identity: Identity) -> None:
             def run_agent_in_worker() -> None:
                 try:
                     result_queue.put(
-                        ("completed", run_agent(identity, context, messages, system_prompt))
+                        (
+                            "completed",
+                            run_agent(
+                                Identity.PROJECT_MANAGER,
+                                context,
+                                messages,
+                                system_prompt,
+                            ),
+                        )
                     )
                 except BaseException as exc:
                     result_queue.put(("error", exc))
 
             worker = threading.Thread(
                 target=run_agent_in_worker,
-                name=f"agent-{project_id}-{identity.value}",
+                name=f"project-manager-agent-{project_id}-{identity.value}",
                 daemon=True,
             )
             worker.start()
@@ -459,7 +509,7 @@ def render_chat(project_id: int, identity: Identity) -> None:
             if outcome == "completed":
                 answer = str(value)
                 runtime_status.update(
-                    label=f"{profile.declared_role} completed",
+                    label=f"{agent_profile.declared_role} completed",
                     state="complete",
                     expanded=False,
                 )
@@ -485,8 +535,8 @@ def render_chat(project_id: int, identity: Identity) -> None:
                     {
                         "project_id": project_id,
                         "conversation_id": conversation_id,
-                        "agent_id": profile.agent_id,
-                        "declared_role": profile.declared_role,
+                        "agent_id": agent_profile.agent_id,
+                        "declared_role": agent_profile.declared_role,
                         "target_file": None,
                         "operation": "agent_run",
                         "tool_parameters": {
@@ -504,7 +554,7 @@ def render_chat(project_id: int, identity: Identity) -> None:
                 )
                 runtime_status.update(
                     label=(
-                        f"{profile.declared_role} failed "
+                        f"{agent_profile.declared_role} failed "
                         f"({diagnostic['diagnostic_id']})"
                     ),
                     state="error",

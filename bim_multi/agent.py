@@ -7,7 +7,7 @@ from .config import API_KEY, BASE_URL, MODEL_NAME, TEMPERATURE
 from .domain import Identity, PROFILES
 from .ifc_tools import IFCResearchTools, ToolContext
 from .ifcmcp_adapter import IfcMCPAdapter
-from .prompts import SYSTEM_PROMPTS
+from .prompts import DISCIPLINE_SYSTEM_PROMPTS, SYSTEM_PROMPTS
 from .tabular_tools import ProjectDataTools
 from . import storage
 
@@ -94,12 +94,7 @@ def _run_delegated_task(
         manager_context.db_path,
         task_conversation_id,
     )
-    specialist_prompt = storage.get_system_prompt(
-        manager_context.db_path,
-        manager_context.project_id,
-        specialist,
-        SYSTEM_PROMPTS[specialist],
-    )
+    specialist_prompt = DISCIPLINE_SYSTEM_PROMPTS[specialist]
     manager_profile = PROFILES[manager_context.identity]
     try:
         answer = run_agent(
