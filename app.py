@@ -468,6 +468,7 @@ def render_chat(project_id: int, identity: Identity) -> None:
                 conversation_id=conversation_id,
                 identity=Identity.PROJECT_MANAGER,
                 input_message=prompt,
+                user_identity=identity,
                 event_callback=enqueue_runtime_event,
             )
 

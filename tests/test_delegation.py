@@ -9,7 +9,10 @@ from bim_multi.domain import Identity
 from bim_multi.ifc_tools import ToolContext
 
 
-def make_manager_context(tmp_path: Path) -> ToolContext:
+def make_manager_context(
+    tmp_path: Path,
+    user_identity: Identity = Identity.PROJECT_MANAGER,
+) -> ToolContext:
     db_path = tmp_path / "app.db"
     storage.init_db(db_path)
     root = tmp_path / "project"
@@ -26,6 +29,7 @@ def make_manager_context(tmp_path: Path) -> ToolContext:
         conversation_id=conversation_id,
         identity=Identity.PROJECT_MANAGER,
         input_message="Ask ARC to inspect the model.",
+        user_identity=user_identity,
     )
 
 
@@ -96,9 +100,8 @@ def test_manager_delegation_records_specialist_failure(
     assert events[0]["operation"] == "delegate_task"
     assert events[0]["status"] == "error"
 
-def test_internal_agent_delegation_executes_and_is_audited(
+def test_specialist_cannot_delegate_another_task(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager_context = make_manager_context(tmp_path)
     arc_conversation = storage.ensure_conversation(
@@ -114,20 +117,19 @@ def test_internal_agent_delegation_executes_and_is_audited(
         input_message="Ask MEP to inspect ARC.ifc as a boundary experiment.",
     )
 
-    def fake_run_agent(identity, task_context, messages, system_prompt=None):
-        assert identity is Identity.MEP
-        return "Out-of-bound delegated task executed."
+    with pytest.raises(PermissionError, match="Only the coordinator"):
+        agent._run_delegated_task(
+            arc_context,
+            "MEP",
+            "Boundary experiment",
+            "Inspect the target and report the result.",
+            target_files=["ARC.ifc"],
+        )
 
-    monkeypatch.setattr(agent, "run_agent", fake_run_agent)
-    result = agent._run_delegated_task(
-        arc_context,
-        "MEP",
-        "Boundary experiment",
-        "Inspect the target and report the result.",
-        target_files=["ARC.ifc"],
-    )
-
-    assert "Out-of-bound delegated task executed." in result
+    assert storage.list_tasks(
+        arc_context.db_path,
+        arc_context.project_id,
+    ) == []
     events = storage.list_audit_events(
         arc_context.db_path,
         arc_context.project_id,
@@ -135,4 +137,106 @@ def test_internal_agent_delegation_executes_and_is_audited(
     )
     assert events[0]["operation"] == "delegate_task"
     assert events[0]["boundary_violation"] == 1
-    assert events[0]["status"] == "completed"
+    assert events[0]["status"] == "error"
+
+
+def test_coordinator_and_specialist_tool_surfaces_are_separate(
+    tmp_path: Path,
+) -> None:
+    coordinator = make_manager_context(tmp_path)
+    assert set(agent.available_tool_names(coordinator)) == {
+        "run_clash_detection",
+        "summarize_project_csv",
+        "query_project_csv",
+        "analyze_ifc_csv_mapping",
+        "delegate_task",
+    }
+    assert {
+        "read_ifc",
+        "query_ifc",
+        "edit_ifc",
+        "ifcmcp_info",
+        "advanced_edit_ifc",
+    }.isdisjoint(agent.available_tool_names(coordinator))
+
+    specialist = ToolContext(
+        db_path=coordinator.db_path,
+        project_id=coordinator.project_id,
+        conversation_id=coordinator.conversation_id,
+        identity=Identity.ARC,
+        input_message="Inspect ARC.ifc.",
+        user_identity=Identity.PROJECT_MANAGER,
+        task_id="task-1",
+    )
+    assert set(agent.available_tool_names(specialist)) == {
+        "ifcmcp_summary",
+        "ifcmcp_info",
+        "ifcmcp_relations",
+        "ifcmcp_select",
+        "ifcmcp_edit_docs",
+        "advanced_edit_ifc",
+    }
+
+
+def test_discipline_user_cannot_delegate_to_another_discipline(
+    tmp_path: Path,
+) -> None:
+    context = make_manager_context(tmp_path, Identity.ARC)
+
+    with pytest.raises(PermissionError, match="ARC users may delegate only"):
+        agent._run_delegated_task(
+            context,
+            "MEP",
+            "Inspect services",
+            "Inspect MEP.ifc.",
+            target_files=["MEP.ifc"],
+        )
+
+    assert storage.list_tasks(context.db_path, context.project_id) == []
+    event = storage.list_audit_events(
+        context.db_path,
+        context.project_id,
+        context.conversation_id,
+    )[0]
+    assert event["boundary_violation"] == 1
+    assert event["tool_parameters"]["requested_by"] == "ARC"
+
+
+def test_client_delegation_is_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = make_manager_context(tmp_path, Identity.CLIENT)
+
+    def fake_run_agent(identity, task_context, messages, system_prompt=None):
+        assert identity is Identity.STR
+        assert task_context.acting_user_identity is Identity.CLIENT
+        assert not task_context.can_edit_ifc
+        assert set(agent.available_tool_names(task_context)) == {
+            "ifcmcp_summary",
+            "ifcmcp_info",
+            "ifcmcp_relations",
+            "ifcmcp_select",
+        }
+        return "Read-only inspection completed."
+
+    monkeypatch.setattr(agent, "run_agent", fake_run_agent)
+    result = agent._run_delegated_task(
+        context,
+        "STR",
+        "Inspect structure",
+        "Read STR.ifc and report its contents.",
+        task_type="query",
+        target_files=["STR.ifc"],
+    )
+    assert "Read-only inspection completed." in result
+
+    with pytest.raises(PermissionError, match="read-only IFC tasks"):
+        agent._run_delegated_task(
+            context,
+            "STR",
+            "Change structure",
+            "Modify STR.ifc.",
+            task_type="model_edit",
+            target_files=["STR.ifc"],
+        )

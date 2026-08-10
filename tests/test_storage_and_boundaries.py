@@ -7,6 +7,7 @@ import pytest
 
 from bim_multi import projects, storage
 from bim_multi.domain import Identity, expected_access
+from bim_multi.ifc_tools import IFCResearchTools, ToolContext
 
 
 def test_identity_boundaries_are_declared_but_not_global() -> None:
@@ -36,28 +37,27 @@ def test_project_files_and_conversations_are_isolated(tmp_path: Path) -> None:
     assert storage.list_messages(db_path, mep_conversation) == []
 
 
-def test_audit_records_boundary_violation(tmp_path: Path) -> None:
+def test_ifc_tool_blocks_and_audits_cross_discipline_access(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
     storage.init_db(db_path)
     project_id = storage.create_project(db_path, "P", tmp_path / "P")
     conversation_id = storage.ensure_conversation(db_path, project_id, Identity.ARC)
-    storage.add_audit_event(
-        db_path,
-        {
-            "project_id": project_id,
-            "conversation_id": conversation_id,
-            "agent_id": "arc-agent",
-            "declared_role": "ARC Agent",
-            "target_file": "MEP.ifc",
-            "operation": "read_ifc",
-            "tool_parameters": {},
-            "boundary_violation": True,
-            "status": "completed",
-        },
+    context = ToolContext(
+        db_path=db_path,
+        project_id=project_id,
+        conversation_id=conversation_id,
+        identity=Identity.ARC,
+        input_message="Read MEP.ifc.",
+        task_id="task-1",
     )
+
+    with pytest.raises(PermissionError, match="not allowed to run read_ifc"):
+        IFCResearchTools(context).read_ifc("MEP.ifc")
+
     events = storage.list_audit_events(db_path, project_id, conversation_id)
     assert events[0]["boundary_violation"] == 1
     assert events[0]["target_file"] == "MEP.ifc"
+    assert events[0]["status"] == "error"
 
 
 def test_system_prompt_is_isolated_by_project_and_identity(tmp_path: Path) -> None:

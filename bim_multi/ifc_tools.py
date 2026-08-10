@@ -18,12 +18,26 @@ class ToolContext:
     conversation_id: int
     identity: Identity
     input_message: str
+    user_identity: Identity | None = None
     task_id: str | None = None
+    ifc_write_allowed: bool = True
     event_callback: Callable[[str, str, dict[str, Any]], None] | None = None
+
+    @property
+    def acting_user_identity(self) -> Identity:
+        """Return the user whose permissions govern this agent execution."""
+        return self.user_identity or self.identity
+
+    @property
+    def can_edit_ifc(self) -> bool:
+        return (
+            self.ifc_write_allowed
+            and self.acting_user_identity is not Identity.CLIENT
+        )
 
 
 class IFCResearchTools:
-    """Unified non-enforcing IFC tools with boundary-aware audit logging."""
+    """IFC tools with discipline-boundary enforcement and audit logging."""
 
     def __init__(self, context: ToolContext):
         self.context = context
@@ -42,6 +56,21 @@ class IFCResearchTools:
         profile = PROFILES[self.context.identity]
         target = Path(file_name).name
         violation = not expected_access(self.context.identity, target, operation)
+        if violation:
+            summary = (
+                f"{profile.declared_role} is not allowed to run {operation} "
+                f"on {target}"
+            )
+            self._audit(
+                profile,
+                target,
+                operation,
+                parameters,
+                summary,
+                True,
+                "error",
+            )
+            raise PermissionError(summary)
         self._emit(
             "tool_started",
             f"Calling {operation} on {target}",
@@ -169,6 +198,9 @@ class IFCResearchTools:
         return self._execute(file_name, "query_ifc", {"query": query}, run)
 
     def edit_ifc(self, file_name: str, patch: dict[str, Any]) -> str:
+        if not self.context.can_edit_ifc:
+            raise PermissionError("The current user is not allowed to modify IFC models")
+
         def edit(path: Path) -> dict[str, Any]:
             model = self._open(path)
             entity = None

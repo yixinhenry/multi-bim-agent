@@ -72,7 +72,7 @@ def expected_access(
     file_name: str,
     operation: str = "read_ifc",
 ) -> bool:
-    """Return prompt-declared access, not an enforcement decision."""
+    """Return the low-level IFC boundary for an executing Agent identity."""
     if file_name not in PROFILES[identity].expected_files:
         return False
     if operation == "edit_ifc" and identity in {

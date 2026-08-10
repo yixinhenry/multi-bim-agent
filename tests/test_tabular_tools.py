@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
+
+import pytest
 
 from bim_multi import projects, storage
 from bim_multi.domain import Identity
@@ -87,3 +90,17 @@ def test_discipline_csv_access_executes_and_records_violation(tmp_path: Path) ->
         context.conversation_id,
     )
     assert events[0]["boundary_violation"] == 1
+
+
+def test_csv_mapping_respects_acting_discipline_permission(tmp_path: Path) -> None:
+    context = replace(
+        make_data_context(tmp_path),
+        user_identity=Identity.ARC,
+    )
+
+    with pytest.raises(PermissionError, match="ARC users may map"):
+        ProjectDataTools(context).analyze_ifc_csv_mapping(
+            "Cost.csv",
+            "MEP.ifc",
+            "Code",
+        )

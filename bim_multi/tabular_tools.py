@@ -100,6 +100,17 @@ class ProjectDataTools:
         ifc_field: str = "GlobalId",
         limit: int = 20,
     ) -> str:
+        ifc_target = Path(ifc_file_name).name
+        acting_user = self.context.acting_user_identity
+        if (
+            acting_user in {Identity.ARC, Identity.STR, Identity.MEP}
+            and ifc_target not in PROFILES[acting_user].expected_files
+        ):
+            raise PermissionError(
+                f"{acting_user.value} users may map CSV data only to "
+                f"{acting_user.value}.ifc"
+            )
+
         def analyze(path: Path) -> dict[str, Any]:
             columns, rows, _ = self._read_rows(path)
             if csv_column not in columns:
@@ -111,7 +122,7 @@ class ProjectDataTools:
             _, ifc_path = projects.resolve_ifc(
                 self.context.db_path,
                 self.context.project_id,
-                ifc_file_name,
+                ifc_target,
             )
             try:
                 import ifcopenshell
@@ -155,7 +166,7 @@ class ProjectDataTools:
             file_name,
             "analyze_ifc_csv_mapping",
             {
-                "ifc_file_name": ifc_file_name,
+                "ifc_file_name": ifc_target,
                 "csv_column": csv_column,
                 "ifc_field": ifc_field,
                 "limit": limit,
