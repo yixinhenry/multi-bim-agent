@@ -12,9 +12,18 @@ from bim_multi import projects, storage
 from bim_multi.agent import availability_message, run_agent
 from bim_multi.config import DB_PATH, MODEL_NAME, PROJECTS_DIR
 from bim_multi.diagnostics import diagnostic_markdown, exception_diagnostic
-from bim_multi.domain import Identity, PROFILES
+from bim_multi.domain import (
+    PROFILES,
+    ROLES_BY_IDENTITY,
+    ROLE_PROFILES,
+    Identity,
+    ProjectRole,
+    can_view_schedule,
+    visible_context_roles,
+)
 from bim_multi.ifc_tools import ToolContext
-from bim_multi.prompts import SYSTEM_PROMPTS
+from bim_multi.prompts import SYSTEM_PROMPTS, system_prompt_for_role
+from bim_multi.schedule import load_schedule
 from bim_multi.viewer_server import start_viewer_server
 
 
@@ -215,31 +224,98 @@ def render_project_menu() -> int | None:
     return st.session_state.get("project_id")
 
 
-def render_sidebar(project_id: int | None) -> Identity:
+def render_sidebar_schedule(project_id: int, project_role: ProjectRole) -> None:
+    if not can_view_schedule(project_role):
+        return
+    with st.sidebar.container(border=True):
+        st.markdown("**Project schedule**")
+        schedule_record = storage.project_files(DB_PATH, project_id).get("SCHEDULE")
+        if schedule_record is None:
+            st.caption("Schedule.csv has not been uploaded.")
+            return
+        try:
+            summary = load_schedule(Path(schedule_record["path"]))
+        except (OSError, ValueError) as exc:
+            st.error(f"Unable to display Schedule.csv: {exc}")
+            return
+
+        st.progress(
+            summary.overall_progress / 100,
+            text=f"Overall progress · {summary.overall_progress:.0f}%",
+        )
+        st.caption(
+            f"{summary.planned_start.isoformat()} → "
+            f"{summary.planned_finish.isoformat()} · "
+            f"{summary.completed_tasks}/{len(summary.tasks)} tasks completed"
+        )
+        with st.expander(f"Schedule tasks ({len(summary.tasks)})"):
+            for task in summary.tasks:
+                st.markdown(f"**{task.name}**")
+                detail = " · ".join(
+                    value
+                    for value in (task.discipline, task.status)
+                    if value
+                )
+                st.progress(
+                    task.progress / 100,
+                    text=f"{detail} · {task.progress:g}%",
+                )
+                st.caption(
+                    f"{task.planned_start.isoformat()} → "
+                    f"{task.planned_finish.isoformat()}"
+                )
+
+
+def render_sidebar(project_id: int | None) -> ProjectRole:
     st.sidebar.markdown('<div class="app-title">BIM Multi-Agent</div>', unsafe_allow_html=True)
     st.sidebar.caption(f"Model: {MODEL_NAME}")
     if project_id is None:
         st.sidebar.info("Create a project from the menu in the top-left corner.")
-        return Identity.CLIENT
+        return ProjectRole.CL_REP
     project = storage.get_project(DB_PATH, project_id)
     st.sidebar.caption(f"Project: {project['name']} · P{project_id:03d}")
+
+    selected_value = st.session_state.get("_active_project_role", ProjectRole.CL_REP.value)
+    try:
+        selected_role = ProjectRole(selected_value)
+    except ValueError:
+        selected_role = ProjectRole.CL_REP
+
+    render_sidebar_schedule(project_id, selected_role)
     st.sidebar.divider()
-    identity = st.sidebar.radio(
-        "Current identity",
-        IDENTITY_ORDER,
-        format_func=lambda item: PROFILES[item].label,
-    )
+    st.sidebar.caption("Current identity")
+    for group_identity in IDENTITY_ORDER:
+        group_roles = ROLES_BY_IDENTITY[group_identity]
+        with st.sidebar.expander(
+            PROFILES[group_identity].label,
+            expanded=ROLE_PROFILES[selected_role].identity is group_identity,
+        ):
+            for role in group_roles:
+                role_profile = ROLE_PROFILES[role]
+                if st.button(
+                    f"{role_profile.label} · {role.value}",
+                    key=f"select-role-{project_id}-{role.value}",
+                    type="primary" if role is selected_role else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state["_active_project_role"] = role.value
+                    st.rerun()
+
     previous_identity = st.session_state.get("_active_identity")
+    identity = ROLE_PROFILES[selected_role].identity
     if previous_identity is not None and previous_identity != identity.value:
         st.session_state.pop("viewer_clash", None)
     st.session_state["_active_identity"] = identity.value
+    role_profile = ROLE_PROFILES[selected_role]
     st.sidebar.markdown(
-        f'<div class="identity-card"><strong>{PROFILES[identity].label}</strong>'
+        f'<div class="identity-card"><strong>{role_profile.label}</strong>'
+        f'<div class="muted">Role: {selected_role.value}</div>'
         f'<div class="muted">Agent: {PROFILES[Identity.PROJECT_MANAGER].declared_role}</div>'
-        f'<div class="muted">Conversation: {project_id}:{identity.value}:main</div></div>',
+        f'<div class="muted">Conversation: {project_id}:{selected_role.value}</div>'
+        f'<div class="muted">{role_profile.responsibility}</div></div>',
         unsafe_allow_html=True,
     )
-    return identity
+    return selected_role
 
 
 def model_choices(project_id: int, identity: Identity) -> list[tuple[str, ...]]:
@@ -390,16 +466,36 @@ def render_clash_issue_panel(project_id: int, identity: Identity) -> None:
             st.divider()
 
 
-def render_chat(project_id: int, identity: Identity) -> None:
-    profile = PROFILES[identity]
+def render_chat(project_id: int, project_role: ProjectRole) -> None:
+    role_profile = ROLE_PROFILES[project_role]
+    identity = role_profile.identity
     agent_profile = PROFILES[Identity.PROJECT_MANAGER]
-    conversation_id = storage.ensure_conversation(DB_PATH, project_id, identity)
-    st.subheader(profile.label)
-    st.caption(f"{agent_profile.declared_role} · Isolated conversation")
+    visible_roles = visible_context_roles(project_role)
+    context_role = project_role
+    st.subheader(role_profile.label)
+    st.caption(f"{agent_profile.declared_role} · Isolated role memory")
+    if len(visible_roles) > 1:
+        context_role = st.selectbox(
+            "Conversation context",
+            visible_roles,
+            format_func=lambda role: f"{ROLE_PROFILES[role].label} · {role.value}",
+            key=f"context-role-{project_id}-{project_role.value}",
+        )
+    conversation_id = storage.ensure_role_conversation(
+        DB_PATH,
+        project_id,
+        context_role,
+    )
+    read_only_context = context_role is not project_role
     render_task_panel(project_id)
     render_clash_issue_panel(project_id, identity)
     with st.container(height=500, border=True):
-        messages = storage.list_messages(DB_PATH, conversation_id)
+        messages = storage.list_role_context_messages(
+            DB_PATH,
+            project_id,
+            project_role,
+            context_role,
+        )
         if not messages:
             st.caption("No messages yet.")
         for message in messages:
@@ -409,7 +505,17 @@ def render_chat(project_id: int, identity: Identity) -> None:
     warning = availability_message()
     if warning:
         st.caption(warning)
-    prompt = st.chat_input("Enter a natural-language task", key=f"chat-{project_id}-{identity.value}")
+    prompt = None
+    if read_only_context:
+        st.info(
+            f"Read-only {context_role.value} context. Return to "
+            f"{project_role.value} to continue your own conversation."
+        )
+    else:
+        prompt = st.chat_input(
+            "Enter a natural-language task",
+            key=f"chat-{project_id}-{project_role.value}",
+        )
     if prompt:
         storage.add_message(DB_PATH, conversation_id, "user", prompt)
         messages = storage.list_messages(DB_PATH, conversation_id)
@@ -423,9 +529,10 @@ def render_chat(project_id: int, identity: Identity) -> None:
                 f"{selection.get('ifc_type')}, GlobalId={selection.get('global_id')}, "
                 f"Name={selection.get('name')}.",
             }
-        system_prompt = storage.get_system_prompt(
+        base_system_prompt = storage.get_system_prompt(
             DB_PATH, project_id, identity, SYSTEM_PROMPTS[identity]
         )
+        system_prompt = system_prompt_for_role(base_system_prompt, project_role)
         with st.status(
             f"{agent_profile.declared_role} is working",
             expanded=True,
@@ -586,6 +693,8 @@ def render_chat(project_id: int, identity: Identity) -> None:
                     DB_PATH, project_id, identity, edited_prompt.strip()
                 )
                 st.success("System prompt saved for this project and identity.")
+        st.markdown("**Applied detailed role policy**")
+        st.caption(f"{project_role.value}: {role_profile.prompt_policy}")
 
 
 def main() -> None:
@@ -598,15 +707,18 @@ def main() -> None:
     inject_css()
     storage.init_db(DB_PATH)
     project_id = render_project_menu()
-    identity = render_sidebar(project_id)
+    project_role = render_sidebar(project_id)
     if project_id is None:
         st.title("BIM Multi-Agent IFC Collaboration Platform")
         st.info("Create the first project from the menu in the top-left corner.")
         return
+    identity = ROLE_PROFILES[project_role].identity
     project = storage.get_project(DB_PATH, project_id)
     top_left, top_middle = st.columns([2, 2])
     top_left.markdown(f"### {project['name']}")
-    top_middle.caption(f"Current identity: {PROFILES[identity].label}")
+    top_middle.caption(
+        f"Current role: {ROLE_PROFILES[project_role].label} · {project_role.value}"
+    )
     viewer_column, chat_column = st.columns([2.15, 1], gap="medium")
     with viewer_column:
         st.markdown(
@@ -619,7 +731,7 @@ def main() -> None:
             '<span class="chat-column-marker"></span>',
             unsafe_allow_html=True,
         )
-        render_chat(project_id, identity)
+        render_chat(project_id, project_role)
 
 
 if __name__ == "__main__":

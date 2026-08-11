@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .domain import Identity, TaskStatus
+from .domain import (
+    ROLE_PROFILES,
+    Identity,
+    ProjectRole,
+    TaskStatus,
+    can_view_role_context,
+    role_conversation_key,
+)
 
 
 SCHEMA = """
@@ -258,6 +265,20 @@ def ensure_conversation(
     return int(row["id"])
 
 
+def ensure_role_conversation(
+    db_path: Path,
+    project_id: int,
+    role: ProjectRole,
+) -> int:
+    profile = ROLE_PROFILES[role]
+    return ensure_conversation(
+        db_path,
+        project_id,
+        profile.identity,
+        conversation_key=role_conversation_key(role),
+    )
+
+
 def add_message(db_path: Path, conversation_id: int, role: str, content: str) -> int:
     with closing(connect(db_path)) as connection, connection:
         cursor = connection.execute(
@@ -276,6 +297,21 @@ def list_messages(db_path: Path, conversation_id: int) -> list[dict[str, Any]]:
             "SELECT * FROM messages WHERE conversation_id=? ORDER BY id", (conversation_id,)
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def list_role_context_messages(
+    db_path: Path,
+    project_id: int,
+    viewer_role: ProjectRole,
+    target_role: ProjectRole,
+) -> list[dict[str, Any]]:
+    """Read a role memory after enforcing the narrow lead visibility rule."""
+    if not can_view_role_context(viewer_role, target_role):
+        raise PermissionError(
+            f"{viewer_role.value} cannot view the {target_role.value} context"
+        )
+    conversation_id = ensure_role_conversation(db_path, project_id, target_role)
+    return list_messages(db_path, conversation_id)
 
 
 def get_system_prompt(

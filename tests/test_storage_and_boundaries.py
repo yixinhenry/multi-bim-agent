@@ -6,7 +6,14 @@ from pathlib import Path
 import pytest
 
 from bim_multi import projects, storage
-from bim_multi.domain import Identity, expected_access
+from bim_multi.domain import (
+    ROLE_PROFILES,
+    Identity,
+    ProjectRole,
+    can_view_schedule,
+    expected_access,
+    visible_context_roles,
+)
 from bim_multi.ifc_tools import IFCResearchTools, ToolContext
 
 
@@ -35,6 +42,86 @@ def test_project_files_and_conversations_are_isolated(tmp_path: Path) -> None:
     storage.add_message(db_path, arc_conversation, "user", "ARC only")
     assert len(storage.list_messages(db_path, arc_conversation)) == 1
     assert storage.list_messages(db_path, mep_conversation) == []
+
+
+def test_detailed_roles_and_lead_context_visibility() -> None:
+    assert len(ROLE_PROFILES) == 14
+    assert visible_context_roles(ProjectRole.ARC_CHK) == (ProjectRole.ARC_CHK,)
+    assert visible_context_roles(ProjectRole.PM_MGR) == (ProjectRole.PM_MGR,)
+    assert visible_context_roles(ProjectRole.CL_APP) == (ProjectRole.CL_APP,)
+    assert visible_context_roles(ProjectRole.ARC_LEAD) == (
+        ProjectRole.ARC_MOD,
+        ProjectRole.ARC_CHK,
+        ProjectRole.ARC_LEAD,
+    )
+    assert visible_context_roles(ProjectRole.STR_LEAD) == (
+        ProjectRole.STR_MOD,
+        ProjectRole.STR_CHK,
+        ProjectRole.STR_LEAD,
+    )
+    assert visible_context_roles(ProjectRole.MEP_LEAD) == (
+        ProjectRole.MEP_MOD,
+        ProjectRole.MEP_CHK,
+        ProjectRole.MEP_LEAD,
+    )
+
+
+def test_schedule_visibility_matches_p05_roles() -> None:
+    visible = {role for role in ProjectRole if can_view_schedule(role)}
+    assert visible == {
+        ProjectRole.CL_REP,
+        ProjectRole.CL_APP,
+        ProjectRole.PM_BIM,
+        ProjectRole.PM_CTL,
+        ProjectRole.PM_MGR,
+        ProjectRole.ARC_LEAD,
+        ProjectRole.STR_LEAD,
+        ProjectRole.MEP_LEAD,
+    }
+
+
+def test_role_memories_are_isolated_and_only_discipline_leads_can_read_group(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "app.db"
+    storage.init_db(db_path)
+    project_id = storage.create_project(db_path, "P", tmp_path / "P")
+    arc_mod = storage.ensure_role_conversation(
+        db_path,
+        project_id,
+        ProjectRole.ARC_MOD,
+    )
+    arc_checker = storage.ensure_role_conversation(
+        db_path,
+        project_id,
+        ProjectRole.ARC_CHK,
+    )
+    assert arc_mod != arc_checker
+    storage.add_message(db_path, arc_mod, "user", "ARC modeler memory")
+    storage.add_message(db_path, arc_checker, "user", "ARC checker memory")
+
+    lead_view = storage.list_role_context_messages(
+        db_path,
+        project_id,
+        ProjectRole.ARC_LEAD,
+        ProjectRole.ARC_MOD,
+    )
+    assert [message["content"] for message in lead_view] == ["ARC modeler memory"]
+
+    with pytest.raises(PermissionError, match="cannot view"):
+        storage.list_role_context_messages(
+            db_path,
+            project_id,
+            ProjectRole.ARC_CHK,
+            ProjectRole.ARC_MOD,
+        )
+    with pytest.raises(PermissionError, match="cannot view"):
+        storage.list_role_context_messages(
+            db_path,
+            project_id,
+            ProjectRole.ARC_LEAD,
+            ProjectRole.MEP_MOD,
+        )
 
 
 def test_ifc_tool_blocks_and_audits_cross_discipline_access(tmp_path: Path) -> None:
