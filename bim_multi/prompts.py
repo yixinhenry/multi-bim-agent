@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .domain import Identity
+from .domain import ROLE_PROFILES, Identity, ProjectRole
 
 
 COMMON = """
@@ -42,26 +42,38 @@ only that discipline's IFC file.
 """,
     Identity.ARC: COORDINATOR
     + """
-The current user is an ARC Engineer. Delegate IFC queries, analysis, edits, and
-remediation only to the ARC Agent and only for ARC.ifc. You may run federated
-clash detection and explain its results, but do not delegate work on STR.ifc or
-MEP.ifc and do not request changes outside ARC.
+The current user belongs to the ARC discipline. Follow the detailed role policy
+appended below. Delegate permitted IFC work only to the ARC Agent and only for
+ARC.ifc. You may run federated clash detection and explain its results, but do not
+delegate work on STR.ifc or MEP.ifc.
 """,
     Identity.STR: COORDINATOR
     + """
-The current user is a STR Engineer. Delegate IFC queries, analysis, edits, and
-remediation only to the STR Agent and only for STR.ifc. You may run federated
-clash detection and explain its results, but do not delegate work on ARC.ifc or
-MEP.ifc and do not request changes outside STR.
+The current user belongs to the STR discipline. Follow the detailed role policy
+appended below. Delegate permitted IFC work only to the STR Agent and only for
+STR.ifc. You may run federated clash detection and explain its results, but do not
+delegate work on ARC.ifc or MEP.ifc.
 """,
     Identity.MEP: COORDINATOR
     + """
-The current user is an MEP Engineer. Delegate IFC queries, analysis, edits, and
-remediation only to the MEP Agent and only for MEP.ifc. You may run federated
-clash detection and explain its results, but do not delegate work on ARC.ifc or
-STR.ifc and do not request changes outside MEP.
+The current user belongs to the MEP discipline. Follow the detailed role policy
+appended below. Delegate permitted IFC work only to the MEP Agent and only for
+MEP.ifc. You may run federated clash detection and explain its results, but do not
+delegate work on ARC.ifc or STR.ifc.
 """,
 }
+
+
+def system_prompt_for_role(base_prompt: str, role: ProjectRole) -> str:
+    profile = ROLE_PROFILES[role]
+    return (
+        base_prompt.rstrip()
+        + "\n\nDetailed user role policy (apply this policy to the current request):\n"
+        + f"- role code: {role.value}\n"
+        + f"- role title: {profile.label}\n"
+        + f"- responsibility: {profile.responsibility}\n"
+        + f"- permissions and limits: {profile.prompt_policy}\n"
+    )
 
 
 DISCIPLINE_SYSTEM_PROMPTS = {
