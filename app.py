@@ -27,7 +27,6 @@ from bim_multi.ifc_tools import ToolContext
 from bim_multi.prompts import (
     CDE_STATE_PROMPTS,
     SYSTEM_PROMPTS,
-    role_can_access_state,
     system_prompt_for_role,
 )
 from bim_multi.schedule import load_schedule
@@ -123,6 +122,14 @@ def inject_css() -> None:
         }
         iframe { border: 1px solid #dbe3ec !important; border-radius: 12px; }
         [data-testid="stChatMessage"] { padding: .7rem; }
+        [data-testid="stButtonGroup"] [role="radiogroup"] {
+            flex-wrap: nowrap !important;
+        }
+        [data-testid="stButtonGroup"] button[data-variant="segmented_control"] {
+            flex: 1 1 0 !important;
+            min-width: 0 !important;
+            padding-inline: .35rem !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -375,18 +382,11 @@ def render_cde_state_selector(
         default=CDEState.WIP.value,
         key=key,
         selection_mode="single",
+        help="Select the CDE permission context applied to the Agent prompt.",
+        label_visibility="collapsed",
+        width="stretch",
     )
-    state = CDEState(selected or CDEState.WIP.value)
-    if role_can_access_state(project_role, state):
-        st.caption(
-            f"{project_role.value} is operating under the {state.value} permission prompt."
-        )
-    else:
-        st.warning(
-            f"{project_role.value} has no access to {state.value}. The Agent prompt "
-            "will refuse model, file, and state actions in this context."
-        )
-    return state
+    return CDEState(selected or CDEState.WIP.value)
 
 
 def _display_timestamp(value: str | None) -> str:
@@ -405,23 +405,24 @@ def render_version_information(
 ) -> None:
     records = storage.project_files(DB_PATH, project_id)
     labels = {"ARC": "Architecture", "STR": "Structure", "MEP": "MEP"}
-    st.markdown("**Version information**")
-    for kind in disciplines:
-        record = records[kind]
-        revision = int(record.get("revision_number") or 1)
-        with st.container(border=True):
-            columns = st.columns(6)
-            values = (
-                ("Revision", f"R{revision:02d}"),
-                ("Discipline", labels[kind]),
-                ("Current status", cde_state.value),
-                ("Uploaded by", record.get("uploaded_by") or "Legacy import"),
-                ("Updated", _display_timestamp(record.get("updated_at"))),
-                ("Approved by", record.get("approved_by") or "—"),
+    with st.popover(
+        "Info",
+        help="Show revision, discipline, status, uploader, update time, and approver.",
+        use_container_width=True,
+    ):
+        for index, kind in enumerate(disciplines):
+            record = records[kind]
+            revision = int(record.get("revision_number") or 1)
+            if index:
+                st.divider()
+            st.markdown(
+                f"**{labels[kind]} · R{revision:02d} · {cde_state.value}**"
             )
-            for column, (label, value) in zip(columns, values):
-                column.caption(label)
-                column.markdown(f"**{value}**")
+            st.caption(
+                f"Uploaded by: {record.get('uploaded_by') or 'Legacy import'}  ·  "
+                f"Updated: {_display_timestamp(record.get('updated_at'))}  ·  "
+                f"Approved by: {record.get('approved_by') or '—'}"
+            )
 
 
 def render_viewer(
@@ -429,9 +430,9 @@ def render_viewer(
     identity: Identity,
     project_role: ProjectRole,
 ) -> CDEState:
-    cde_state = render_cde_state_selector(project_id, project_role)
     choices = model_choices(project_id, identity)
     if not choices:
+        cde_state = render_cde_state_selector(project_id, project_role)
         st.info("No permitted IFC model combination is available. Upload this identity's model first.")
         return cde_state
     selector_key = f"viewer-models-{project_id}-{identity.value}"
@@ -445,15 +446,25 @@ def render_viewer(
         st.session_state[selector_key] = tuple(override["models"])
     if st.session_state.get(selector_key) not in choices:
         st.session_state[selector_key] = choices[-1]
-    selected = st.selectbox(
-        "Models",
-        choices,
-        format_func=lambda choice: (
-            choice[0] if len(choice) == 1 else f"Federated: {' + '.join(choice)}"
-        ),
-        key=selector_key,
+    state_column, model_column, version_column = st.columns(
+        [4.3, 3.5, 1.2],
+        gap="small",
+        vertical_alignment="center",
     )
-    render_version_information(project_id, selected, cde_state)
+    with state_column:
+        cde_state = render_cde_state_selector(project_id, project_role)
+    with model_column:
+        selected = st.selectbox(
+            "Models",
+            choices,
+            format_func=lambda choice: (
+                choice[0] if len(choice) == 1 else f"Federated: {' + '.join(choice)}"
+            ),
+            key=selector_key,
+            label_visibility="collapsed",
+        )
+    with version_column:
+        render_version_information(project_id, selected, cde_state)
     kinds, version = model_query(project_id, selected)
     url = viewer_url(str(DB_PATH))
     clash = st.session_state.get("viewer_clash")
