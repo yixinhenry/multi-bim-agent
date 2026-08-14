@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from .domain import ROLE_PROFILES, Identity, ProjectRole
+from .domain import (
+    ROLE_PERMISSION_CODES,
+    ROLE_PROFILES,
+    CDEState,
+    Identity,
+    ProjectRole,
+)
 
 
 COMMON = """
@@ -9,6 +15,65 @@ Use IFC tools for model facts. Report relevant IFC type, GlobalId, and STEP id.
 All changes are applied to the current project IFC and must be described clearly.
 Never claim a tool succeeded unless its result confirms success.
 """
+
+
+CDE_COMMON_POLICY = """
+CDE rules that apply in every state:
+- Permissions apply only to the current project and the user's authorized scope.
+- Element access may be narrowed by discipline, task, work package, and IFC GlobalId.
+- A query cannot bypass model, discipline, assignment, or state restrictions.
+- To change Shared, Published, or Archived information, create a new WIP revision.
+- B01 always applies: never modify another discipline, an unassigned element, or a non-WIP IFC.
+- Any permission not explicitly granted is denied.
+"""
+
+
+CDE_STATE_PROMPTS = {
+    CDEState.WIP: """
+Current CDE state: WIP.
+WIP is the discipline work area for production, checking, and approval. Access
+requires P01. Only a modeler with P07-P11 may upload, edit assigned elements,
+create a revision, and submit it. A checker with P12 may review and return work
+without editing it. A discipline lead with P13 may approve reviewed information
+for Shared without editing it. All WIP actions outside the role's discipline,
+assignment, and permission codes must be refused.
+""",
+    CDEState.SHARED: """
+Current CDE state: Shared.
+Shared access requires P02 and is read-only. P03 permits an authorized federated
+view. Queries and coordination may use accessible elements. Only P14 permits
+clash detection. Issue creation, assignment, and updates require P15, P16, and
+P17 respectively. Refuse uploads, direct property or geometry edits, and any
+attempt to overwrite Shared information.
+""",
+    CDEState.PUBLISHED: """
+Current CDE state: Published.
+Published access requires P04 and is read-only within the authorized formal
+delivery scope. Element queries require P05 and downloads require P06. Major
+change approval or formal delivery acceptance requires P20. P21 permits the
+BIM/CDE coordinator to publish information only after required review and
+approval gates pass. Refuse all direct model edits.
+""",
+    CDEState.ARCHIVED: """
+Current CDE state: Archived.
+Archived revisions are read-only history. Viewing is limited to the role's
+previously authorized model or Published delivery scope. P21 permits the BIM/CDE
+coordinator to archive superseded revisions. Refuse edits, replacement of the
+current version, and restoration that directly overwrites a current revision;
+any change must start as a new WIP revision.
+""",
+}
+
+
+def role_can_access_state(role: ProjectRole, state: CDEState) -> bool:
+    codes = set(ROLE_PERMISSION_CODES[role])
+    if state is CDEState.WIP:
+        return "P01" in codes
+    if state is CDEState.SHARED:
+        return "P02" in codes
+    if state is CDEState.PUBLISHED:
+        return "P04" in codes
+    return "P04" in codes or "P21" in codes
 
 COORDINATOR = COMMON + """
 You are the Project Manager Agent and the only user-facing Agent. Coordinate the
@@ -64,15 +129,33 @@ delegate work on ARC.ifc or STR.ifc.
 }
 
 
-def system_prompt_for_role(base_prompt: str, role: ProjectRole) -> str:
+def system_prompt_for_role(
+    base_prompt: str,
+    role: ProjectRole,
+    cde_state: CDEState | None = None,
+) -> str:
     profile = ROLE_PROFILES[role]
-    return (
+    prompt = (
         base_prompt.rstrip()
         + "\n\nDetailed user role policy (apply this policy to the current request):\n"
         + f"- role code: {role.value}\n"
         + f"- role title: {profile.label}\n"
         + f"- responsibility: {profile.responsibility}\n"
         + f"- permissions and limits: {profile.prompt_policy}\n"
+    )
+    if cde_state is None:
+        return prompt
+    access = role_can_access_state(role, cde_state)
+    access_policy = (
+        "The current role has state access; enforce only its explicitly granted actions."
+        if access
+        else "The current role has no access to this CDE state. Refuse model, file, and state actions."
+    )
+    return (
+        prompt
+        + CDE_COMMON_POLICY
+        + CDE_STATE_PROMPTS[cde_state]
+        + f"\nCurrent role/state decision: {access_policy}\n"
     )
 
 

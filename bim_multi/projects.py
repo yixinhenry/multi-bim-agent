@@ -36,6 +36,7 @@ def save_upload(
     kind: str,
     original_filename: str,
     source: BinaryIO,
+    uploaded_by: str | None = None,
 ) -> Path:
     if kind not in KINDS:
         raise ValueError(f"Unsupported project file kind: {kind}")
@@ -52,7 +53,14 @@ def save_upload(
     temporary.write_bytes(payload)
     temporary.replace(target)
     target.with_suffix(".frag").unlink(missing_ok=True)
-    storage.upsert_project_file(db_path, project_id, kind, target, original_filename)
+    storage.upsert_project_file(
+        db_path,
+        project_id,
+        kind,
+        target,
+        original_filename,
+        uploaded_by=uploaded_by,
+    )
     return target
 
 

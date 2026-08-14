@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS project_files (
     kind TEXT NOT NULL,
     path TEXT NOT NULL,
     original_filename TEXT NOT NULL,
+    revision_number INTEGER NOT NULL DEFAULT 1,
+    uploaded_by TEXT,
+    approved_by TEXT,
     updated_at TEXT NOT NULL,
     PRIMARY KEY(project_id, kind),
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -168,6 +171,20 @@ def init_db(db_path: Path) -> None:
                 connection.execute(
                     f"ALTER TABLE tasks ADD COLUMN {column} {definition}"
                 )
+        project_file_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(project_files)").fetchall()
+        }
+        project_file_migrations = {
+            "revision_number": "INTEGER NOT NULL DEFAULT 1",
+            "uploaded_by": "TEXT",
+            "approved_by": "TEXT",
+        }
+        for column, definition in project_file_migrations.items():
+            if column not in project_file_columns:
+                connection.execute(
+                    f"ALTER TABLE project_files ADD COLUMN {column} {definition}"
+                )
         # Translate the exact application-generated legacy error prefix while
         # preserving user-authored messages in their original research language.
         connection.execute(
@@ -214,18 +231,32 @@ def upsert_project_file(
     kind: str,
     path: Path,
     original_filename: str,
+    uploaded_by: str | None = None,
 ) -> None:
     with closing(connect(db_path)) as connection, connection:
         connection.execute(
             """
-            INSERT INTO project_files(project_id, kind, path, original_filename, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO project_files(
+                project_id, kind, path, original_filename, revision_number,
+                uploaded_by, approved_by, updated_at
+            )
+            VALUES (?, ?, ?, ?, 1, ?, NULL, ?)
             ON CONFLICT(project_id, kind) DO UPDATE SET
                 path=excluded.path,
                 original_filename=excluded.original_filename,
+                revision_number=project_files.revision_number + 1,
+                uploaded_by=excluded.uploaded_by,
+                approved_by=NULL,
                 updated_at=excluded.updated_at
             """,
-            (project_id, kind, str(path.resolve()), original_filename, now()),
+            (
+                project_id,
+                kind,
+                str(path.resolve()),
+                original_filename,
+                uploaded_by,
+                now(),
+            ),
         )
 
 

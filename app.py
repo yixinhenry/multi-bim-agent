@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from datetime import datetime
 from itertools import combinations
 from pathlib import Path
 
@@ -16,13 +17,19 @@ from bim_multi.domain import (
     PROFILES,
     ROLES_BY_IDENTITY,
     ROLE_PROFILES,
+    CDEState,
     Identity,
     ProjectRole,
     can_view_schedule,
     visible_context_roles,
 )
 from bim_multi.ifc_tools import ToolContext
-from bim_multi.prompts import SYSTEM_PROMPTS, system_prompt_for_role
+from bim_multi.prompts import (
+    CDE_STATE_PROMPTS,
+    SYSTEM_PROMPTS,
+    role_can_access_state,
+    system_prompt_for_role,
+)
 from bim_multi.schedule import load_schedule
 from bim_multi.viewer_server import start_viewer_server
 
@@ -122,6 +129,15 @@ def inject_css() -> None:
     )
 
 
+def active_project_role() -> ProjectRole:
+    try:
+        return ProjectRole(
+            st.session_state.get("_active_project_role", ProjectRole.CL_REP.value)
+        )
+    except ValueError:
+        return ProjectRole.CL_REP
+
+
 def render_project_files(project_id: int) -> None:
     file_records = storage.project_files(DB_PATH, project_id)
     st.markdown("#### Project files")
@@ -150,7 +166,12 @@ def render_project_files(project_id: int) -> None:
         ):
             try:
                 projects.save_upload(
-                    DB_PATH, project_id, kind, upload.name, upload
+                    DB_PATH,
+                    project_id,
+                    kind,
+                    upload.name,
+                    upload,
+                    uploaded_by=active_project_role().value,
                 )
             except Exception as exc:
                 st.error(f"Unable to save {label}: {exc}")
@@ -343,11 +364,76 @@ def model_query(project_id: int, disciplines: tuple[str, ...]) -> tuple[str, str
     return ",".join(disciplines), "|".join(versions)
 
 
-def render_viewer(project_id: int, identity: Identity) -> None:
+def render_cde_state_selector(
+    project_id: int,
+    project_role: ProjectRole,
+) -> CDEState:
+    key = f"cde-state-{project_id}-{project_role.value}"
+    selected = st.segmented_control(
+        "CDE status",
+        [state.value for state in CDEState],
+        default=CDEState.WIP.value,
+        key=key,
+        selection_mode="single",
+    )
+    state = CDEState(selected or CDEState.WIP.value)
+    if role_can_access_state(project_role, state):
+        st.caption(
+            f"{project_role.value} is operating under the {state.value} permission prompt."
+        )
+    else:
+        st.warning(
+            f"{project_role.value} has no access to {state.value}. The Agent prompt "
+            "will refuse model, file, and state actions in this context."
+        )
+    return state
+
+
+def _display_timestamp(value: str | None) -> str:
+    if not value:
+        return "—"
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        return value
+
+
+def render_version_information(
+    project_id: int,
+    disciplines: tuple[str, ...],
+    cde_state: CDEState,
+) -> None:
+    records = storage.project_files(DB_PATH, project_id)
+    labels = {"ARC": "Architecture", "STR": "Structure", "MEP": "MEP"}
+    st.markdown("**Version information**")
+    for kind in disciplines:
+        record = records[kind]
+        revision = int(record.get("revision_number") or 1)
+        with st.container(border=True):
+            columns = st.columns(6)
+            values = (
+                ("Revision", f"R{revision:02d}"),
+                ("Discipline", labels[kind]),
+                ("Current status", cde_state.value),
+                ("Uploaded by", record.get("uploaded_by") or "Legacy import"),
+                ("Updated", _display_timestamp(record.get("updated_at"))),
+                ("Approved by", record.get("approved_by") or "—"),
+            )
+            for column, (label, value) in zip(columns, values):
+                column.caption(label)
+                column.markdown(f"**{value}**")
+
+
+def render_viewer(
+    project_id: int,
+    identity: Identity,
+    project_role: ProjectRole,
+) -> CDEState:
+    cde_state = render_cde_state_selector(project_id, project_role)
     choices = model_choices(project_id, identity)
     if not choices:
         st.info("No permitted IFC model combination is available. Upload this identity's model first.")
-        return
+        return cde_state
     selector_key = f"viewer-models-{project_id}-{identity.value}"
     override = st.session_state.pop("viewer_model_override", None)
     if (
@@ -367,6 +453,7 @@ def render_viewer(project_id: int, identity: Identity) -> None:
         ),
         key=selector_key,
     )
+    render_version_information(project_id, selected, cde_state)
     kinds, version = model_query(project_id, selected)
     url = viewer_url(str(DB_PATH))
     clash = st.session_state.get("viewer_clash")
@@ -385,6 +472,7 @@ def render_viewer(project_id: int, identity: Identity) -> None:
         f"&models={kinds}&v={version}{clash_query}",
         height=720,
     )
+    return cde_state
 
 def render_task_panel(project_id: int) -> None:
     tasks = storage.list_tasks(DB_PATH, project_id, limit=20)
@@ -466,7 +554,11 @@ def render_clash_issue_panel(project_id: int, identity: Identity) -> None:
             st.divider()
 
 
-def render_chat(project_id: int, project_role: ProjectRole) -> None:
+def render_chat(
+    project_id: int,
+    project_role: ProjectRole,
+    cde_state: CDEState,
+) -> None:
     role_profile = ROLE_PROFILES[project_role]
     identity = role_profile.identity
     agent_profile = PROFILES[Identity.PROJECT_MANAGER]
@@ -532,7 +624,11 @@ def render_chat(project_id: int, project_role: ProjectRole) -> None:
         base_system_prompt = storage.get_system_prompt(
             DB_PATH, project_id, identity, SYSTEM_PROMPTS[identity]
         )
-        system_prompt = system_prompt_for_role(base_system_prompt, project_role)
+        system_prompt = system_prompt_for_role(
+            base_system_prompt,
+            project_role,
+            cde_state,
+        )
         with st.status(
             f"{agent_profile.declared_role} is working",
             expanded=True,
@@ -695,6 +791,8 @@ def render_chat(project_id: int, project_role: ProjectRole) -> None:
                 st.success("System prompt saved for this project and identity.")
         st.markdown("**Applied detailed role policy**")
         st.caption(f"{project_role.value}: {role_profile.prompt_policy}")
+        st.markdown("**Applied CDE state policy**")
+        st.caption(CDE_STATE_PROMPTS[cde_state].strip())
 
 
 def main() -> None:
@@ -725,13 +823,13 @@ def main() -> None:
             '<span class="viewer-column-marker"></span>',
             unsafe_allow_html=True,
         )
-        render_viewer(project_id, identity)
+        cde_state = render_viewer(project_id, identity, project_role)
     with chat_column:
         st.markdown(
             '<span class="chat-column-marker"></span>',
             unsafe_allow_html=True,
         )
-        render_chat(project_id, project_role)
+        render_chat(project_id, project_role, cde_state)
 
 
 if __name__ == "__main__":
