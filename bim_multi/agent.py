@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import API_KEY, BASE_URL, MODEL_NAME, TEMPERATURE
-from .domain import Identity, PROFILES
+from .domain import Identity, PROFILES, ROLE_PROFILES
 from .ifc_tools import IFCResearchTools, ToolContext
 from .ifcmcp_adapter import IfcMCPAdapter
 from .prompts import DISCIPLINE_SYSTEM_PROMPTS, SYSTEM_PROMPTS
@@ -17,6 +17,7 @@ _SPECIALISTS = {Identity.ARC, Identity.STR, Identity.MEP}
 _WRITE_TASK_TYPES = {"model_edit", "clash_remediation"}
 _COORDINATOR_TOOL_NAMES = (
     "run_clash_detection",
+    "assign_clash_issues",
     "summarize_project_csv",
     "query_project_csv",
     "analyze_ifc_csv_mapping",
@@ -46,6 +47,62 @@ def available_tool_names(context: ToolContext) -> tuple[str, ...]:
     if context.can_edit_ifc:
         names += _SPECIALIST_WRITE_TOOL_NAMES
     return names
+
+
+def assign_clash_issue_responsibility(
+    context: ToolContext,
+    issue_ids: list[str],
+    assigned_to: str,
+) -> str:
+    """Assign persisted Clash Issues and create two discipline-level notifications."""
+    discipline = assigned_to.strip().upper()
+    if discipline not in {"ARC", "STR", "MEP"}:
+        raise ValueError("assigned_to must be ARC, STR, or MEP")
+    normalized_ids = list(dict.fromkeys(issue_ids))
+    updated = storage.assign_clash_issues(
+        context.db_path,
+        context.project_id,
+        normalized_ids,
+        discipline,
+    )
+    if updated == 0:
+        raise ValueError("No Clash Issues matched the supplied issue_ids")
+    title = f"{updated} Clash Issue(s) assigned to {discipline}"
+    payload = {
+        "discipline": discipline,
+        "issue_ids": normalized_ids,
+        "issue_count": updated,
+    }
+    for recipient in (f"{discipline}-MOD-GROUP", f"{discipline}-CHK"):
+        storage.create_notification(
+            context.db_path,
+            context.project_id,
+            recipient,
+            "clash_assignment",
+            title,
+            payload,
+            source_id=normalized_ids[0],
+        )
+    profile = PROFILES[context.identity]
+    storage.add_audit_event(
+        context.db_path,
+        {
+            "project_id": context.project_id,
+            "conversation_id": context.conversation_id,
+            "agent_id": profile.agent_id,
+            "declared_role": (
+                context.project_role.value
+                if context.project_role is not None
+                else profile.declared_role
+            ),
+            "operation": "assign_clash_issue",
+            "tool_parameters": payload,
+            "input_message": context.input_message,
+            "result_summary": title,
+            "status": "completed",
+        },
+    )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _deny_delegation(
@@ -187,6 +244,8 @@ def _run_delegated_task(
         conversation_id=task_conversation_id,
         identity=specialist,
         input_message=instructions.strip(),
+        project_role=manager_context.project_role,
+        viewer_models=manager_context.viewer_models,
         user_identity=requested_by,
         task_id=task_id,
         ifc_write_allowed=(
@@ -200,6 +259,13 @@ def _run_delegated_task(
         task_conversation_id,
     )
     specialist_prompt = DISCIPLINE_SYSTEM_PROMPTS[specialist]
+    if manager_context.project_role is not None:
+        role_profile = ROLE_PROFILES[manager_context.project_role]
+        specialist_prompt += (
+            "\nActing user's concrete role policy:\n"
+            f"- role code: {manager_context.project_role.value}\n"
+            f"- permissions and limits: {role_profile.prompt_policy}\n"
+        )
     manager_profile = PROFILES[manager_context.identity]
     try:
         answer = run_agent(
@@ -333,6 +399,10 @@ def run_agent(
     project_data_tools = ProjectDataTools(context)
     emit = context.event_callback or (lambda event, message, payload: None)
     profile = PROFILES[identity]
+
+    def assign_clash_issues(issue_ids: list[str], assigned_to: str) -> str:
+        return assign_clash_issue_responsibility(context, issue_ids, assigned_to)
+
     emit(
         "agent_started",
         f"{profile.declared_role} started working",
@@ -399,11 +469,20 @@ def run_agent(
         "run_clash_detection": StructuredTool.from_function(
             name="run_clash_detection",
             description=(
-                "Run world-coordinate AABB clash-candidate detection across uploaded discipline "
-                "models. file_names is optional; when omitted, use every currently uploaded "
-                "ARC/STR/MEP model. Never require all three models."
+                "Run world-coordinate AABB clash-candidate detection using exactly the Shared "
+                "Viewer combination captured with the current user message. The combination "
+                "must contain two or three models. Parameters are tolerance and limit only."
             ),
             func=research_tools.run_clash_detection,
+        ),
+        "assign_clash_issues": StructuredTool.from_function(
+            name="assign_clash_issues",
+            description=(
+                "Assign persisted Clash Issue ids to one responsible discipline. "
+                "Parameters: issue_ids and assigned_to (ARC, STR, or MEP). "
+                "Responsibility never targets a detailed MOD category."
+            ),
+            func=assign_clash_issues,
         ),
         "ifcmcp_edit_docs": StructuredTool.from_function(
             name="ifcmcp_edit_docs",
@@ -493,6 +572,8 @@ def run_agent(
         f"- execution scope: {scope}\n"
         f"- identity: {identity.value}\n"
         f"- acting user identity: {context.acting_user_identity.value}\n"
+        f"- concrete project role: {context.project_role.value if context.project_role else 'unspecified'}\n"
+        f"- Viewer model snapshot: {[(item.discipline, item.cde_state.value, item.generation) for item in context.viewer_models]}\n"
         f"- agent_id: {profile.agent_id}\n"
         f"- declared role: {profile.declared_role}\n"
         f"- declared readable IFC files: {sorted(profile.expected_files)}\n"

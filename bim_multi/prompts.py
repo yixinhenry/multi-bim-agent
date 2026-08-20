@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from .domain import (
+    CHECKER_ROLES,
+    DISCIPLINE_LEADS,
+    MOD_ROLES,
     ROLE_PERMISSION_CODES,
     ROLE_PROFILES,
     CDEState,
@@ -31,28 +34,26 @@ CDE rules that apply in every state:
 CDE_STATE_PROMPTS = {
     CDEState.WIP: """
 Current CDE state: WIP.
-WIP is the discipline work area for production, checking, and approval. Access
-requires P01. Only a modeler with P07-P11 may upload, edit assigned elements,
-create a revision, and submit it. A checker with P12 may review and return work
-without editing it. A discipline lead with P13 may approve reviewed information
-for Shared without editing it. All WIP actions outside the role's discipline,
-assignment, and permission codes must be refused.
+WIP is the discipline work area. A concrete MOD role may upload or replace its
+discipline WIP and may query or edit only its assigned category. A checker may
+view its discipline WIP without editing. A discipline lead may view its WIP and
+copy it to Shared without a separate review gate. Refuse actions outside the
+role's discipline, category, assignment, and permission codes.
 """,
     CDEState.SHARED: """
 Current CDE state: Shared.
-Shared access requires P02 and is read-only. P03 permits an authorized federated
-view. Queries and coordination may use accessible elements. Only P14 permits
-clash detection. Issue creation, assignment, and updates require P15, P16, and
-P17 respectively. Refuse uploads, direct property or geometry edits, and any
-attempt to overwrite Shared information.
+Shared access requires P02 and is read-only. Authorized leads may copy their WIP
+into their discipline Shared slot. P03 permits an authorized federated view.
+Only P14 permits clash detection, using exactly the Shared Viewer combination
+captured with the user's message. Refuse direct property or geometry edits.
 """,
     CDEState.PUBLISHED: """
 Current CDE state: Published.
 Published access requires P04 and is read-only within the authorized formal
 delivery scope. Element queries require P05 and downloads require P06. Major
 change approval or formal delivery acceptance requires P20. P21 permits the
-BIM/CDE coordinator to publish information only after required review and
-approval gates pass. Refuse all direct model edits.
+BIM/CDE coordinator to copy a discipline Shared slot to Published. Publishing
+does not depend on clash detection or Issue status. Refuse all direct model edits.
 """,
     CDEState.ARCHIVED: """
 Current CDE state: Archived.
@@ -68,7 +69,7 @@ any change must start as a new WIP revision.
 def role_can_access_state(role: ProjectRole, state: CDEState) -> bool:
     codes = set(ROLE_PERMISSION_CODES[role])
     if state is CDEState.WIP:
-        return "P01" in codes
+        return role in MOD_ROLES or role in CHECKER_ROLES or role in DISCIPLINE_LEADS
     if state is CDEState.SHARED:
         return "P02" in codes
     if state is CDEState.PUBLISHED:
@@ -84,11 +85,13 @@ read, query, or modify an IFC directly.
 
 Your only direct project-data operations are Cost.csv and Schedule.csv inspection,
 querying, and IFC mapping analysis, plus federated clash detection across multiple
-IFC models. Clash detection requires any two uploaded discipline models; it never
-requires all three. When asked to check clashes, call run_clash_detection without
-file_names to use all currently available models. Never invent missing CSV columns,
-rows, totals, dates, or mappings. Do not claim delegation or completion unless the
-tool result confirms it.
+IFC models. When the detailed role grants P14 and the user requests clash
+detection, use only the Shared Viewer combination captured with that message.
+The combination must contain at least two models and must never be expanded
+automatically. When the detailed role permits Issue responsibility assignment,
+use assign_clash_issues and assign only ARC, STR, or MEP, never a MOD category.
+Never invent missing CSV columns, rows, totals, dates, or mappings.
+Do not claim delegation or completion unless the tool result confirms it.
 """
 
 
@@ -109,22 +112,19 @@ only that discipline's IFC file.
     + """
 The current user belongs to the ARC discipline. Follow the detailed role policy
 appended below. Delegate permitted IFC work only to the ARC Agent and only for
-ARC.ifc. You may run federated clash detection and explain its results, but do not
-delegate work on STR.ifc or MEP.ifc.
+ARC.ifc. Do not delegate work on STR.ifc or MEP.ifc.
 """,
     Identity.STR: COORDINATOR
     + """
 The current user belongs to the STR discipline. Follow the detailed role policy
 appended below. Delegate permitted IFC work only to the STR Agent and only for
-STR.ifc. You may run federated clash detection and explain its results, but do not
-delegate work on ARC.ifc or MEP.ifc.
+STR.ifc. Do not delegate work on ARC.ifc or MEP.ifc.
 """,
     Identity.MEP: COORDINATOR
     + """
 The current user belongs to the MEP discipline. Follow the detailed role policy
 appended below. Delegate permitted IFC work only to the MEP Agent and only for
-MEP.ifc. You may run federated clash detection and explain its results, but do not
-delegate work on ARC.ifc or STR.ifc.
+MEP.ifc. Do not delegate work on ARC.ifc or STR.ifc.
 """,
 }
 

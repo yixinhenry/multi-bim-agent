@@ -8,7 +8,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import projects, storage
-from .domain import Identity, PROFILES, expected_access
+from .domain import CDEState, Identity, PROFILES, ProjectRole, expected_access
+
+
+@dataclass(frozen=True)
+class ViewerModelSnapshot:
+    discipline: str
+    cde_state: CDEState
+    updated_at: str
+    generation: int
+    size: int
 
 
 @dataclass(frozen=True)
@@ -18,6 +27,8 @@ class ToolContext:
     conversation_id: int
     identity: Identity
     input_message: str
+    project_role: ProjectRole | None = None
+    viewer_models: tuple[ViewerModelSnapshot, ...] = ()
     user_identity: Identity | None = None
     task_id: str | None = None
     ifc_write_allowed: bool = True
@@ -234,30 +245,48 @@ class IFCResearchTools:
 
     def run_clash_detection(
         self,
-        file_names: list[str] | None = None,
         tolerance: float = 0.002,
         limit: int = 200,
     ) -> str:
-        """Check world-coordinate AABB overlaps across uploaded IFC models."""
-        available = storage.project_files(
-            self.context.db_path, self.context.project_id
-        )
-        if file_names:
-            requested = [Path(name).name for name in file_names]
-        else:
-            requested = [
-                f"{kind}.ifc" for kind in ("ARC", "STR", "MEP") if kind in available
-            ]
-        requested = list(dict.fromkeys(requested))
-        if len(requested) < 2:
+        """Check the Shared Viewer combination captured with the user message."""
+        snapshots = list(self.context.viewer_models)
+        if len(snapshots) < 2:
             raise ValueError(
-                "Clash detection requires any two uploaded discipline models; "
-                f"available models: {requested or 'none'}"
+                "Clash detection requires at least two Shared models loaded in Viewer"
             )
-        resolved = [
-            projects.resolve_ifc(self.context.db_path, self.context.project_id, name)
-            for name in requested
-        ]
+        if len(snapshots) > 3 or any(
+            snapshot.cde_state is not CDEState.SHARED for snapshot in snapshots
+        ):
+            raise ValueError("Clash detection uses only a two- or three-model Shared Viewer combination")
+        disciplines = [snapshot.discipline for snapshot in snapshots]
+        if len(set(disciplines)) != len(disciplines):
+            raise ValueError("The Viewer clash snapshot contains duplicate disciplines")
+        requested = [f"{discipline}.ifc" for discipline in disciplines]
+        resolved = []
+        model_records = []
+        for snapshot in snapshots:
+            kind, path, record = projects.resolve_model_slot(
+                self.context.db_path,
+                self.context.project_id,
+                snapshot.discipline,
+                CDEState.SHARED,
+            )
+            if (
+                record["updated_at"] != snapshot.updated_at
+                or int(record["generation"]) != snapshot.generation
+                or path.stat().st_size != snapshot.size
+            ):
+                raise ValueError("A Shared model changed after the Viewer snapshot; submit the request again")
+            resolved.append((kind, path))
+            model_records.append(
+                {
+                    "discipline": kind,
+                    "cde_state": CDEState.SHARED.value,
+                    "updated_at": record["updated_at"],
+                    "generation": int(record["generation"]),
+                    "size": path.stat().st_size,
+                }
+            )
         profile = PROFILES[self.context.identity]
         outside = [
             f"{kind}.ifc"
@@ -271,7 +300,7 @@ class IFCResearchTools:
             Identity.PROJECT_MANAGER,
         } and bool(outside)
         parameters = {
-            "file_names": requested,
+            "viewer_models": model_records,
             "tolerance": float(tolerance),
             "limit": int(limit),
         }
@@ -367,11 +396,20 @@ class IFCResearchTools:
                                     }
                                 )
                     pair_counts[pair_name] = pair_count
+            clash_run_id = storage.create_clash_run(
+                self.context.db_path,
+                self.context.project_id,
+                model_records,
+                pair_counts,
+                parameters,
+                self.context.project_role.value if self.context.project_role else None,
+            )
             issue_ids = storage.upsert_clash_issues(
                 self.context.db_path,
                 self.context.project_id,
                 results,
                 source_task_id=self.context.task_id,
+                last_run_id=clash_run_id,
             )
             total_clashes = sum(pair_counts.values())
             truncated = total_clashes > len(results)
@@ -383,7 +421,28 @@ class IFCResearchTools:
                     [tuple(pair.split("-", 1)) for pair in pair_counts],
                     issue_ids,
                 )
+            combination = " + ".join(disciplines)
+            for discipline in disciplines:
+                related_count = sum(
+                    count
+                    for pair, count in pair_counts.items()
+                    if discipline in pair.split("-", 1)
+                )
+                storage.create_notification(
+                    self.context.db_path,
+                    self.context.project_id,
+                    f"{discipline}-LEAD",
+                    "clash_run",
+                    f"{combination}: {related_count} related clash(es)",
+                    {
+                        "clash_run_id": clash_run_id,
+                        "disciplines": disciplines,
+                        "issue_count": related_count,
+                    },
+                    source_id=clash_run_id,
+                )
             payload = {
+                "clash_run_id": clash_run_id,
                 "models_checked": requested,
                 "pair_counts": pair_counts,
                 "total_clashes": total_clashes,

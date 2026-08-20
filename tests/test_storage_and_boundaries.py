@@ -78,22 +78,34 @@ def test_project_file_version_metadata_increments_on_replacement(tmp_path: Path)
 
 
 def test_detailed_roles_and_lead_context_visibility() -> None:
-    assert len(ROLE_PROFILES) == 14
+    assert len(ROLE_PROFILES) == 26
     assert visible_context_roles(ProjectRole.ARC_CHK) == (ProjectRole.ARC_CHK,)
     assert visible_context_roles(ProjectRole.PM_MGR) == (ProjectRole.PM_MGR,)
     assert visible_context_roles(ProjectRole.CL_APP) == (ProjectRole.CL_APP,)
     assert visible_context_roles(ProjectRole.ARC_LEAD) == (
-        ProjectRole.ARC_MOD,
+        ProjectRole.ARC_MOD_SHELL,
+        ProjectRole.ARC_MOD_INTERIOR,
+        ProjectRole.ARC_MOD_FACADE,
+        ProjectRole.ARC_MOD_FIRE,
+        ProjectRole.ARC_MOD_SITE,
         ProjectRole.ARC_CHK,
         ProjectRole.ARC_LEAD,
     )
     assert visible_context_roles(ProjectRole.STR_LEAD) == (
-        ProjectRole.STR_MOD,
+        ProjectRole.STR_MOD_FOUNDATION,
+        ProjectRole.STR_MOD_CONCRETE,
+        ProjectRole.STR_MOD_STEEL,
+        ProjectRole.STR_MOD_REBAR,
         ProjectRole.STR_CHK,
         ProjectRole.STR_LEAD,
     )
     assert visible_context_roles(ProjectRole.MEP_LEAD) == (
-        ProjectRole.MEP_MOD,
+        ProjectRole.MEP_MOD_HVAC,
+        ProjectRole.MEP_MOD_PLUMBING,
+        ProjectRole.MEP_MOD_FIRE,
+        ProjectRole.MEP_MOD_ELECTRICAL,
+        ProjectRole.MEP_MOD_ELV,
+        ProjectRole.MEP_MOD_BMS,
         ProjectRole.MEP_CHK,
         ProjectRole.MEP_LEAD,
     )
@@ -122,7 +134,7 @@ def test_role_memories_are_isolated_and_only_discipline_leads_can_read_group(
     arc_mod = storage.ensure_role_conversation(
         db_path,
         project_id,
-        ProjectRole.ARC_MOD,
+        ProjectRole.ARC_MOD_SHELL,
     )
     arc_checker = storage.ensure_role_conversation(
         db_path,
@@ -137,7 +149,7 @@ def test_role_memories_are_isolated_and_only_discipline_leads_can_read_group(
         db_path,
         project_id,
         ProjectRole.ARC_LEAD,
-        ProjectRole.ARC_MOD,
+        ProjectRole.ARC_MOD_SHELL,
     )
     assert [message["content"] for message in lead_view] == ["ARC modeler memory"]
 
@@ -146,14 +158,14 @@ def test_role_memories_are_isolated_and_only_discipline_leads_can_read_group(
             db_path,
             project_id,
             ProjectRole.ARC_CHK,
-            ProjectRole.ARC_MOD,
+            ProjectRole.ARC_MOD_SHELL,
         )
     with pytest.raises(PermissionError, match="cannot view"):
         storage.list_role_context_messages(
             db_path,
             project_id,
             ProjectRole.ARC_LEAD,
-            ProjectRole.MEP_MOD,
+            ProjectRole.MEP_MOD_HVAC,
         )
 
 
