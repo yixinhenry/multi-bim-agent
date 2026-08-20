@@ -3,7 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from itertools import combinations
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -13,16 +13,29 @@ from bim_multi.agent import availability_message, run_agent
 from bim_multi.config import DB_PATH, MODEL_NAME, PROJECTS_DIR
 from bim_multi.diagnostics import diagnostic_markdown, exception_diagnostic
 from bim_multi.domain import (
+    CHECKER_ROLES,
+    DISCIPLINE_LEADS,
+    MOD_ROLES,
+    MOD_ROLES_BY_IDENTITY,
     PROFILES,
     ROLES_BY_IDENTITY,
     ROLE_PROFILES,
+    CDEState,
     Identity,
     ProjectRole,
     can_view_schedule,
+    can_view_clash_issue,
+    role_discipline,
+    notification_recipient_key,
+    viewer_model_choices,
     visible_context_roles,
 )
-from bim_multi.ifc_tools import ToolContext
-from bim_multi.prompts import SYSTEM_PROMPTS, system_prompt_for_role
+from bim_multi.ifc_tools import ToolContext, ViewerModelSnapshot
+from bim_multi.prompts import (
+    CDE_STATE_PROMPTS,
+    SYSTEM_PROMPTS,
+    system_prompt_for_role,
+)
 from bim_multi.schedule import load_schedule
 from bim_multi.viewer_server import start_viewer_server
 
@@ -116,19 +129,71 @@ def inject_css() -> None:
         }
         iframe { border: 1px solid #dbe3ec !important; border-radius: 12px; }
         [data-testid="stChatMessage"] { padding: .7rem; }
+        [data-testid="stButtonGroup"] [role="radiogroup"] {
+            flex-wrap: nowrap !important;
+        }
+        [data-testid="stButtonGroup"] button[data-variant="segmented_control"] {
+            flex: 1 1 0 !important;
+            min-width: 0 !important;
+            padding-inline: .35rem !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
+def active_project_role() -> ProjectRole:
+    try:
+        return ProjectRole(
+            st.session_state.get("_active_project_role", ProjectRole.CL_REP.value)
+        )
+    except ValueError:
+        return ProjectRole.CL_REP
+
+
 def render_project_files(project_id: int) -> None:
     file_records = storage.project_files(DB_PATH, project_id)
+    slots = storage.model_slots(DB_PATH, project_id)
+    role = active_project_role()
+    discipline = role_discipline(role)
     st.markdown("#### Project files")
+    if role in MOD_ROLES and discipline:
+        record = slots.get((discipline, CDEState.WIP.value))
+        label = f"{discipline} WIP"
+        if record:
+            st.caption(f"✓ {label} — {record['original_filename']}")
+        else:
+            st.caption(f"○ {label} — not uploaded")
+        upload = st.file_uploader(
+            f"Upload or replace {label}",
+            type=["ifc"],
+            key=f"upload-{project_id}-{discipline}-WIP",
+            label_visibility="collapsed",
+        )
+        if upload is not None and st.button(
+            f"Save {label}",
+            key=f"save-{project_id}-{discipline}-WIP",
+            use_container_width=True,
+        ):
+            try:
+                projects.save_upload(
+                    DB_PATH,
+                    project_id,
+                    discipline,
+                    upload.name,
+                    upload,
+                    uploaded_by=role.value,
+                )
+            except Exception as exc:
+                st.error(f"Unable to save {label}: {exc}")
+            else:
+                st.success(f"{label} uploaded.")
+                st.rerun()
+    else:
+        st.caption("WIP upload is available to concrete MOD roles.")
+
     for kind, label, file_type in [
-        ("ARC", "ARC.ifc", ["ifc"]),
-        ("STR", "STR.ifc", ["ifc"]),
-        ("MEP", "MEP.ifc", ["ifc"]),
         ("COST", "Cost.csv (optional)", ["csv"]),
         ("SCHEDULE", "Schedule.csv (optional)", ["csv"]),
     ]:
@@ -150,13 +215,17 @@ def render_project_files(project_id: int) -> None:
         ):
             try:
                 projects.save_upload(
-                    DB_PATH, project_id, kind, upload.name, upload
+                    DB_PATH,
+                    project_id,
+                    kind,
+                    upload.name,
+                    upload,
+                    uploaded_by=active_project_role().value,
                 )
             except Exception as exc:
                 st.error(f"Unable to save {label}: {exc}")
             else:
                 st.success(f"{label} uploaded.")
-                st.rerun()
 
 
 def render_project_menu() -> int | None:
@@ -217,10 +286,12 @@ def render_project_menu() -> int | None:
     if current_id is None:
         status_column.caption("No active project")
     else:
-        model_count = len(
-            {"ARC", "STR", "MEP"} & set(storage.project_files(DB_PATH, current_id))
+        slots = storage.model_slots(DB_PATH, current_id)
+        wip_count = sum(
+            (discipline, CDEState.WIP.value) in slots
+            for discipline in projects.DISCIPLINES
         )
-        status_column.caption(f"Status: Ready · {model_count}/3 models")
+        status_column.caption(f"Status: Ready · {wip_count}/3 WIP")
     return st.session_state.get("project_id")
 
 
@@ -280,20 +351,34 @@ def render_sidebar(project_id: int | None) -> ProjectRole:
         selected_role = ProjectRole(selected_value)
     except ValueError:
         selected_role = ProjectRole.CL_REP
+    unread_counts = storage.unread_notification_counts(DB_PATH, project_id)
 
     render_sidebar_schedule(project_id, selected_role)
     st.sidebar.divider()
     st.sidebar.caption("Current identity")
     for group_identity in IDENTITY_ORDER:
         group_roles = ROLES_BY_IDENTITY[group_identity]
+        recipient_keys = {role.value for role in group_roles}
+        if group_identity in {Identity.ARC, Identity.STR, Identity.MEP}:
+            recipient_keys.add(f"{group_identity.value}-MOD-GROUP")
+        group_unread = sum(unread_counts.get(key, 0) for key in recipient_keys)
+        group_label = PROFILES[group_identity].label
+        if group_unread:
+            group_label += f" · 🔴 {group_unread}"
         with st.sidebar.expander(
-            PROFILES[group_identity].label,
+            group_label,
             expanded=ROLE_PROFILES[selected_role].identity is group_identity,
         ):
-            for role in group_roles:
+            mod_roles = MOD_ROLES_BY_IDENTITY.get(group_identity, ())
+            if mod_roles:
+                mod_unread = unread_counts.get(
+                    f"{group_identity.value}-MOD-GROUP", 0
+                )
+                st.caption(f"MOD{' · 🔴 ' + str(mod_unread) if mod_unread else ''}")
+            for role in mod_roles:
                 role_profile = ROLE_PROFILES[role]
                 if st.button(
-                    f"{role_profile.label} · {role.value}",
+                    role.value,
                     key=f"select-role-{project_id}-{role.value}",
                     type="primary" if role is selected_role else "secondary",
                     use_container_width=True,
@@ -301,10 +386,29 @@ def render_sidebar(project_id: int | None) -> ProjectRole:
                     st.session_state["_active_project_role"] = role.value
                     st.rerun()
 
-    previous_identity = st.session_state.get("_active_identity")
+            other_roles = tuple(role for role in group_roles if role not in MOD_ROLES)
+            if mod_roles:
+                st.caption("CHK / LEAD")
+            for role in other_roles:
+                role_profile = ROLE_PROFILES[role]
+                role_unread = unread_counts.get(role.value, 0)
+                role_label = f"{role_profile.label} · {role.value}"
+                if role_unread:
+                    role_label += f" · 🔴 {role_unread}"
+                if st.button(
+                    role_label,
+                    key=f"select-role-{project_id}-{role.value}",
+                    type="primary" if role is selected_role else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state["_active_project_role"] = role.value
+                    st.rerun()
+
+    previous_role = st.session_state.get("_previous_project_role")
     identity = ROLE_PROFILES[selected_role].identity
-    if previous_identity is not None and previous_identity != identity.value:
+    if previous_role is not None and previous_role != selected_role.value:
         st.session_state.pop("viewer_clash", None)
+    st.session_state["_previous_project_role"] = selected_role.value
     st.session_state["_active_identity"] = identity.value
     role_profile = ROLE_PROFILES[selected_role]
     st.sidebar.markdown(
@@ -318,55 +422,171 @@ def render_sidebar(project_id: int | None) -> ProjectRole:
     return selected_role
 
 
-def model_choices(project_id: int, identity: Identity) -> list[tuple[str, ...]]:
-    available = [
-        kind
-        for kind in ("ARC", "STR", "MEP")
-        if kind in storage.project_files(DB_PATH, project_id)
-    ]
-    choices = [
-        choice
-        for size in range(1, len(available) + 1)
-        for choice in combinations(available, size)
-    ]
-    if identity in {Identity.ARC, Identity.STR, Identity.MEP}:
-        choices = [choice for choice in choices if identity.value in choice]
-    return choices
+def model_choices(
+    project_id: int,
+    project_role: ProjectRole,
+) -> list[tuple[tuple[str, CDEState], ...]]:
+    available = {
+        (discipline, CDEState(state))
+        for discipline, state in storage.model_slots(DB_PATH, project_id)
+    }
+    return list(viewer_model_choices(project_role, available))
 
 
-def model_query(project_id: int, disciplines: tuple[str, ...]) -> tuple[str, str]:
-    files = storage.project_files(DB_PATH, project_id)
+def model_query(
+    project_id: int,
+    choice: tuple[tuple[str, CDEState], ...],
+) -> tuple[str, str]:
+    slots = storage.model_slots(DB_PATH, project_id)
+    tokens = []
     versions = []
-    for kind in disciplines:
-        path = Path(files[kind]["path"])
-        versions.append(f"{kind}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
-    return ",".join(disciplines), "|".join(versions)
+    for discipline, state in choice:
+        record = slots[(discipline, state.value)]
+        path = Path(record["path"])
+        tokens.append(f"{state.value}:{discipline}")
+        versions.append(
+            f"{state.value}:{discipline}:{record['updated_at']}:"
+            f"{path.stat().st_size}"
+        )
+    return ",".join(tokens), "|".join(versions)
 
 
-def render_viewer(project_id: int, identity: Identity) -> None:
-    choices = model_choices(project_id, identity)
-    if not choices:
-        st.info("No permitted IFC model combination is available. Upload this identity's model first.")
-        return
-    selector_key = f"viewer-models-{project_id}-{identity.value}"
-    override = st.session_state.pop("viewer_model_override", None)
-    if (
-        override
-        and override["project_id"] == project_id
-        and override["identity"] == identity.value
-        and tuple(override["models"]) in choices
+def _choice_label(choice: tuple[tuple[str, CDEState], ...]) -> str:
+    if len(choice) == 1:
+        discipline, state = choice[0]
+        return f"{discipline} · {state.value}"
+    return f"Federated Shared: {' + '.join(discipline for discipline, _ in choice)}"
+
+
+def render_model_actions(project_id: int, project_role: ProjectRole) -> None:
+    slots = storage.model_slots(DB_PATH, project_id)
+    discipline = role_discipline(project_role)
+    if project_role in DISCIPLINE_LEADS and discipline:
+        if st.button(
+            f"Submit {discipline} as Shared",
+            key=f"submit-shared-{project_id}-{discipline}",
+            disabled=(discipline, CDEState.WIP.value) not in slots,
+            use_container_width=True,
+        ):
+            try:
+                projects.submit_shared(
+                    DB_PATH, project_id, discipline, project_role.value
+                )
+            except Exception as exc:
+                st.error(f"Unable to submit Shared: {exc}")
+            else:
+                st.rerun()
+    elif project_role is ProjectRole.PM_BIM:
+        with st.popover("CDE model actions", use_container_width=True):
+            for item_discipline in projects.DISCIPLINES:
+                publish_column, archive_column = st.columns(2)
+                if publish_column.button(
+                    f"Publish {item_discipline}",
+                    key=f"publish-{project_id}-{item_discipline}",
+                    disabled=(item_discipline, CDEState.SHARED.value) not in slots,
+                    use_container_width=True,
+                ):
+                    try:
+                        projects.publish_model(
+                            DB_PATH, project_id, item_discipline, project_role.value
+                        )
+                    except Exception as exc:
+                        st.error(f"Unable to publish {item_discipline}: {exc}")
+                    else:
+                        st.rerun()
+                if archive_column.button(
+                    f"Archive {item_discipline}",
+                    key=f"archive-{project_id}-{item_discipline}",
+                    disabled=(item_discipline, CDEState.PUBLISHED.value) not in slots,
+                    use_container_width=True,
+                ):
+                    try:
+                        projects.archive_model(
+                            DB_PATH, project_id, item_discipline, project_role.value
+                        )
+                    except Exception as exc:
+                        st.error(f"Unable to archive {item_discipline}: {exc}")
+                    else:
+                        st.rerun()
+
+
+def _display_timestamp(value: str | None) -> str:
+    if not value:
+        return "—"
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        return value
+
+
+def render_version_information(
+    project_id: int,
+    choice: tuple[tuple[str, CDEState], ...],
+) -> None:
+    records = storage.model_slots(DB_PATH, project_id)
+    labels = {"ARC": "Architecture", "STR": "Structure", "MEP": "MEP"}
+    with st.popover(
+        "Info",
+        help="Show revision, discipline, status, uploader, update time, and approver.",
+        use_container_width=True,
     ):
-        st.session_state[selector_key] = tuple(override["models"])
+        for index, (kind, cde_state) in enumerate(choice):
+            record = records[(kind, cde_state.value)]
+            generation = int(record.get("generation") or 1)
+            if index:
+                st.divider()
+            st.markdown(
+                f"**{labels[kind]} · G{generation:02d} · {cde_state.value}**"
+            )
+            st.caption(
+                f"Created by: {record.get('created_by_role') or 'Legacy import'}  ·  "
+                f"Updated: {_display_timestamp(record.get('updated_at'))}"
+            )
+
+
+def render_viewer(
+    project_id: int,
+    identity: Identity,
+    project_role: ProjectRole,
+) -> tuple[tuple[str, CDEState], ...]:
+    render_model_actions(project_id, project_role)
+    choices = model_choices(project_id, project_role)
+    if not choices:
+        st.info("No model slot is available for the current role.")
+        return ()
+    selector_key = f"viewer-models-{project_id}-{project_role.value}"
+    override = st.session_state.pop("viewer_model_override", None)
+    if override and override["project_id"] == project_id:
+        override_choice = tuple(
+            (discipline, CDEState(state))
+            for discipline, state in override.get("slots", [])
+        )
+        if override_choice in choices:
+            st.session_state[selector_key] = override_choice
     if st.session_state.get(selector_key) not in choices:
-        st.session_state[selector_key] = choices[-1]
-    selected = st.selectbox(
-        "Models",
-        choices,
-        format_func=lambda choice: (
-            choice[0] if len(choice) == 1 else f"Federated: {' + '.join(choice)}"
-        ),
-        key=selector_key,
+        shared_choices = [
+            choice
+            for choice in choices
+            if all(state is CDEState.SHARED for _, state in choice)
+        ]
+        st.session_state[selector_key] = (
+            max(shared_choices, key=len) if shared_choices else choices[0]
+        )
+    model_column, version_column = st.columns(
+        [7.8, 1.2],
+        gap="small",
+        vertical_alignment="center",
     )
+    with model_column:
+        selected = st.selectbox(
+            "Models",
+            choices,
+            format_func=_choice_label,
+            key=selector_key,
+            label_visibility="collapsed",
+        )
+    with version_column:
+        render_version_information(project_id, selected)
     kinds, version = model_query(project_id, selected)
     url = viewer_url(str(DB_PATH))
     clash = st.session_state.get("viewer_clash")
@@ -385,6 +605,57 @@ def render_viewer(project_id: int, identity: Identity) -> None:
         f"&models={kinds}&v={version}{clash_query}",
         height=720,
     )
+    return selected
+
+def render_notification_panel(project_id: int, project_role: ProjectRole) -> None:
+    recipient_key = notification_recipient_key(project_role)
+    if recipient_key is None:
+        return
+    notifications = storage.list_notifications(
+        DB_PATH, project_id, recipient_key, limit=20
+    )
+    unread = storage.unread_notification_counts(DB_PATH, project_id).get(
+        recipient_key, 0
+    )
+    label = f"Notifications · 🔴 {unread}" if unread else "Notifications"
+    with st.expander(label, expanded=False):
+        if not notifications:
+            st.caption("No notifications yet.")
+            return
+        for notification in notifications:
+            marker = "🔴 " if notification["read_at"] is None else ""
+            if st.button(
+                marker + notification["title"],
+                key=f"notification-{notification['id']}",
+                use_container_width=True,
+            ):
+                if notification["read_at"] is None:
+                    storage.mark_notification_read(
+                        DB_PATH, project_id, notification["id"]
+                    )
+                    storage.add_audit_event(
+                        DB_PATH,
+                        {
+                            "project_id": project_id,
+                            "agent_id": "application",
+                            "declared_role": project_role.value,
+                            "operation": "mark_notification_read",
+                            "tool_parameters": {
+                                "notification_id": notification["id"],
+                                "recipient_key": recipient_key,
+                            },
+                            "result_summary": notification["title"],
+                            "status": "completed",
+                        },
+                    )
+                if notification["notification_type"] in {
+                    "clash_run",
+                    "clash_assignment",
+                }:
+                    st.session_state[f"expand-clash-{project_id}"] = True
+                st.rerun()
+            st.caption(_display_timestamp(notification["created_at"]))
+
 
 def render_task_panel(project_id: int) -> None:
     tasks = storage.list_tasks(DB_PATH, project_id, limit=20)
@@ -417,10 +688,32 @@ def render_task_panel(project_id: int) -> None:
             st.divider()
 
 
-def render_clash_issue_panel(project_id: int, identity: Identity) -> None:
-    issues = storage.list_clash_issues(DB_PATH, project_id, limit=50)
+def render_clash_issue_panel(project_id: int, project_role: ProjectRole) -> None:
+    if (
+        project_role is not ProjectRole.PM_BIM
+        and project_role not in DISCIPLINE_LEADS
+        and project_role not in MOD_ROLES
+        and project_role not in CHECKER_ROLES
+    ):
+        return
+    identity = ROLE_PROFILES[project_role].identity
+    issues = [
+        issue
+        for issue in storage.list_clash_issues(DB_PATH, project_id, limit=50)
+        if can_view_clash_issue(
+            project_role,
+            issue["model_a"],
+            issue["model_b"],
+            issue.get("assigned_to"),
+        )
+    ]
     active = [issue for issue in issues if issue["status"] != "resolved"]
-    with st.expander(f"Clash issues ({len(active)} active / {len(issues)} total)"):
+    expand_key = f"expand-clash-{project_id}"
+    expanded = bool(st.session_state.pop(expand_key, False))
+    with st.expander(
+        f"Clash issues ({len(active)} active / {len(issues)} total)",
+        expanded=expanded,
+    ):
         st.markdown(
             '<span class="clash-panel-marker"></span>',
             unsafe_allow_html=True,
@@ -437,6 +730,12 @@ def render_clash_issue_panel(project_id: int, identity: Identity) -> None:
             st.caption(
                 f"{issue['model_a']}-{issue['model_b']} "
                 f"- last seen {issue['last_seen_at']}"
+            )
+            st.caption(
+                f"{issue['model_a']}: {issue['element_a'].get('ifc_type')} · "
+                f"GlobalId={issue['element_a'].get('global_id')}  |  "
+                f"{issue['model_b']}: {issue['element_b'].get('ifc_type')} · "
+                f"GlobalId={issue['element_b'].get('global_id')}"
             )
             global_id_a = issue["element_a"].get("global_id")
             global_id_b = issue["element_b"].get("global_id")
@@ -457,16 +756,21 @@ def render_clash_issue_panel(project_id: int, identity: Identity) -> None:
                     required.add(identity.value)
                 st.session_state.viewer_model_override = {
                     "project_id": project_id,
-                    "identity": identity.value,
-                    "models": [
-                        kind for kind in ("ARC", "STR", "MEP") if kind in required
+                    "slots": [
+                        (kind, CDEState.SHARED.value)
+                        for kind in ("ARC", "STR", "MEP")
+                        if kind in required
                     ],
                 }
                 st.rerun()
             st.divider()
 
 
-def render_chat(project_id: int, project_role: ProjectRole) -> None:
+def render_chat(
+    project_id: int,
+    project_role: ProjectRole,
+    viewer_models: tuple[tuple[str, CDEState], ...],
+) -> None:
     role_profile = ROLE_PROFILES[project_role]
     identity = role_profile.identity
     agent_profile = PROFILES[Identity.PROJECT_MANAGER]
@@ -487,8 +791,9 @@ def render_chat(project_id: int, project_role: ProjectRole) -> None:
         context_role,
     )
     read_only_context = context_role is not project_role
+    render_notification_panel(project_id, project_role)
     render_task_panel(project_id)
-    render_clash_issue_panel(project_id, identity)
+    render_clash_issue_panel(project_id, project_role)
     with st.container(height=500, border=True):
         messages = storage.list_role_context_messages(
             DB_PATH,
@@ -519,8 +824,29 @@ def render_chat(project_id: int, project_role: ProjectRole) -> None:
     if prompt:
         storage.add_message(DB_PATH, conversation_id, "user", prompt)
         messages = storage.list_messages(DB_PATH, conversation_id)
+        slot_records = storage.model_slots(DB_PATH, project_id)
+        viewer_snapshot = tuple(
+            ViewerModelSnapshot(
+                discipline=discipline,
+                cde_state=state,
+                updated_at=slot_records[(discipline, state.value)]["updated_at"],
+                generation=int(
+                    slot_records[(discipline, state.value)]["generation"]
+                ),
+                size=Path(
+                    slot_records[(discipline, state.value)]["path"]
+                ).stat().st_size,
+            )
+            for discipline, state in viewer_models
+        )
         selection = storage.get_selection(DB_PATH, project_id, identity)
-        if selection:
+        selected_slot = None
+        if selection and selection.get("cde_state"):
+            selected_slot = (
+                selection["model_kind"],
+                CDEState(selection["cde_state"]),
+            )
+        if selection and selected_slot in viewer_models:
             messages[-1] = {
                 **messages[-1],
                 "content": messages[-1]["content"]
@@ -529,10 +855,19 @@ def render_chat(project_id: int, project_role: ProjectRole) -> None:
                 f"{selection.get('ifc_type')}, GlobalId={selection.get('global_id')}, "
                 f"Name={selection.get('name')}.",
             }
-        base_system_prompt = storage.get_system_prompt(
+        identity_prompt = storage.get_system_prompt(
             DB_PATH, project_id, identity, SYSTEM_PROMPTS[identity]
         )
-        system_prompt = system_prompt_for_role(base_system_prompt, project_role)
+        base_system_prompt = storage.get_system_prompt(
+            DB_PATH, project_id, project_role, identity_prompt
+        )
+        viewer_states = {state for _, state in viewer_models}
+        cde_state = next(iter(viewer_states)) if len(viewer_states) == 1 else None
+        system_prompt = system_prompt_for_role(
+            base_system_prompt,
+            project_role,
+            cde_state,
+        )
         with st.status(
             f"{agent_profile.declared_role} is working",
             expanded=True,
@@ -575,6 +910,8 @@ def render_chat(project_id: int, project_role: ProjectRole) -> None:
                 conversation_id=conversation_id,
                 identity=Identity.PROJECT_MANAGER,
                 input_message=prompt,
+                project_role=project_role,
+                viewer_models=viewer_snapshot,
                 user_identity=identity,
                 event_callback=enqueue_runtime_event,
             )
@@ -671,30 +1008,37 @@ def render_chat(project_id: int, project_role: ProjectRole) -> None:
         storage.add_message(DB_PATH, conversation_id, "assistant", answer)
         st.rerun()
 
-    with st.expander("System prompt for this project and identity"):
-        current_prompt = storage.get_system_prompt(
+    with st.expander("System prompt for this project and role"):
+        identity_prompt = storage.get_system_prompt(
             DB_PATH, project_id, identity, SYSTEM_PROMPTS[identity]
+        )
+        current_prompt = storage.get_system_prompt(
+            DB_PATH, project_id, project_role, identity_prompt
         )
         edited_prompt = st.text_area(
             "System prompt",
             value=current_prompt,
             height=260,
-            key=f"system-prompt-{project_id}-{identity.value}",
+            key=f"system-prompt-{project_id}-{project_role.value}",
         )
         if st.button(
             "Save system prompt",
-            key=f"save-system-prompt-{project_id}-{identity.value}",
+            key=f"save-system-prompt-{project_id}-{project_role.value}",
             use_container_width=True,
         ):
             if not edited_prompt.strip():
                 st.error("The system prompt cannot be empty.")
             else:
                 storage.set_system_prompt(
-                    DB_PATH, project_id, identity, edited_prompt.strip()
+                    DB_PATH, project_id, project_role, edited_prompt.strip()
                 )
-                st.success("System prompt saved for this project and identity.")
+                st.success("System prompt saved for this project and role.")
         st.markdown("**Applied detailed role policy**")
         st.caption(f"{project_role.value}: {role_profile.prompt_policy}")
+        if viewer_models:
+            st.markdown("**Applied Viewer state policy**")
+            for state in dict.fromkeys(state for _, state in viewer_models):
+                st.caption(CDE_STATE_PROMPTS[state].strip())
 
 
 def main() -> None:
@@ -706,6 +1050,7 @@ def main() -> None:
     )
     inject_css()
     storage.init_db(DB_PATH)
+    projects.migrate_legacy_ifc_slots(DB_PATH)
     project_id = render_project_menu()
     project_role = render_sidebar(project_id)
     if project_id is None:
@@ -725,13 +1070,13 @@ def main() -> None:
             '<span class="viewer-column-marker"></span>',
             unsafe_allow_html=True,
         )
-        render_viewer(project_id, identity)
+        viewer_models = render_viewer(project_id, identity, project_role)
     with chat_column:
         st.markdown(
             '<span class="chat-column-marker"></span>',
             unsafe_allow_html=True,
         )
-        render_chat(project_id, project_role)
+        render_chat(project_id, project_role, viewer_models)
 
 
 if __name__ == "__main__":

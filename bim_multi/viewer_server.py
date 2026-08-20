@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import projects, storage
-from .domain import Identity, PROFILES
+from .domain import CDEState, Identity, PROFILES
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -61,14 +61,15 @@ class ViewerHandler(BaseHTTPRequestHandler):
             return
         self._selection()
 
-    def _model_request(self, query) -> tuple[int, str, Path] | None:
+    def _model_request(self, query) -> tuple[int, str, CDEState, Path] | None:
         try:
             project_id = int(query["project_id"][0])
             kind = query["kind"][0].upper()
+            cde_state = CDEState(query["state"][0])
             _, path = projects.resolve_ifc(
-                self.server.db_path, project_id, f"{kind}.ifc"
+                self.server.db_path, project_id, f"{kind}.ifc", cde_state
             )
-            return project_id, kind, path
+            return project_id, kind, cde_state, path
         except (KeyError, ValueError, FileNotFoundError):
             self.send_error(400, "Invalid project model")
             return None
@@ -77,9 +78,9 @@ class ViewerHandler(BaseHTTPRequestHandler):
         request = self._model_request(query)
         if request is None:
             return
-        project_id, kind, model_path = request
+        project_id, kind, cde_state, model_path = request
         try:
-            with self.server.model_lock(f"{project_id}:{kind}"):
+            with self.server.model_lock(f"{project_id}:{cde_state.value}:{kind}"):
                 fragment = self._ensure_fragment(model_path)
         except Exception as exc:
             self.send_error(503, f"Fragments conversion failed: {exc}")
@@ -123,8 +124,12 @@ class ViewerHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             project_id = int(payload["project_id"])
             identity = Identity(payload["identity"])
+            cde_state = CDEState(payload["state"])
             kind, model_path = projects.resolve_ifc(
-                self.server.db_path, project_id, f"{payload['kind']}.ifc"
+                self.server.db_path,
+                project_id,
+                f"{payload['kind']}.ifc",
+                cde_state,
             )
             import ifcopenshell
 
@@ -146,6 +151,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 entity.is_a(),
                 info.get("GlobalId"),
                 info.get("Name"),
+                cde_state,
             )
             profile = PROFILES[identity]
             storage.add_audit_event(
@@ -157,7 +163,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
                     ),
                     "agent_id": profile.agent_id,
                     "declared_role": profile.declared_role,
-                    "target_file": f"{kind}.ifc",
+                    "target_file": f"{cde_state.value}/{kind}.ifc",
                     "operation": "viewer_selection",
                     "tool_parameters": {"step_id": entity.id()},
                     "result_summary": f"{entity.is_a()} #{entity.id()}",
@@ -167,6 +173,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
             )
             self._json(200, {
                 "kind": kind,
+                "state": cde_state.value,
                 "step_id": entity.id(),
                 "ifc_type": entity.is_a(),
                 "global_id": info.get("GlobalId"),

@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from .domain import (
     ROLE_PROFILES,
+    CDEState,
     Identity,
     ProjectRole,
     TaskStatus,
@@ -31,8 +32,25 @@ CREATE TABLE IF NOT EXISTS project_files (
     kind TEXT NOT NULL,
     path TEXT NOT NULL,
     original_filename TEXT NOT NULL,
+    revision_number INTEGER NOT NULL DEFAULT 1,
+    uploaded_by TEXT,
+    approved_by TEXT,
     updated_at TEXT NOT NULL,
     PRIMARY KEY(project_id, kind),
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS model_slots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    discipline TEXT NOT NULL,
+    cde_state TEXT NOT NULL,
+    path TEXT NOT NULL,
+    original_filename TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1,
+    source_state TEXT,
+    created_by_role TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE(project_id, discipline, cde_state),
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS conversations (
@@ -74,6 +92,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     FOREIGN KEY(parent_task_id) REFERENCES tasks(id) ON DELETE SET NULL,
     FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE SET NULL
 );
+CREATE TABLE IF NOT EXISTS clash_runs (
+    id TEXT PRIMARY KEY,
+    project_id INTEGER NOT NULL,
+    models_json TEXT NOT NULL,
+    pair_counts_json TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
+    created_by_role TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS clash_issues (
     id TEXT PRIMARY KEY,
     project_id INTEGER NOT NULL,
@@ -88,18 +116,21 @@ CREATE TABLE IF NOT EXISTS clash_issues (
     assigned_to TEXT,
     source_task_id TEXT,
     resolution_task_id TEXT,
+    last_run_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
     UNIQUE(project_id, fingerprint),
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
     FOREIGN KEY(source_task_id) REFERENCES tasks(id) ON DELETE SET NULL,
-    FOREIGN KEY(resolution_task_id) REFERENCES tasks(id) ON DELETE SET NULL
+    FOREIGN KEY(resolution_task_id) REFERENCES tasks(id) ON DELETE SET NULL,
+    FOREIGN KEY(last_run_id) REFERENCES clash_runs(id) ON DELETE SET NULL
 );
 CREATE TABLE IF NOT EXISTS viewer_selections (
     project_id INTEGER NOT NULL,
     identity TEXT NOT NULL,
     model_kind TEXT NOT NULL,
+    cde_state TEXT,
     step_id INTEGER NOT NULL,
     ifc_type TEXT,
     global_id TEXT,
@@ -131,6 +162,18 @@ CREATE TABLE IF NOT EXISTS audit_events (
     boundary_violation INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS notifications (
+    id TEXT PRIMARY KEY,
+    project_id INTEGER NOT NULL,
+    recipient_key TEXT NOT NULL,
+    notification_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    source_id TEXT,
+    created_at TEXT NOT NULL,
+    read_at TEXT,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 """
@@ -168,6 +211,44 @@ def init_db(db_path: Path) -> None:
                 connection.execute(
                     f"ALTER TABLE tasks ADD COLUMN {column} {definition}"
                 )
+        project_file_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(project_files)").fetchall()
+        }
+        project_file_migrations = {
+            "revision_number": "INTEGER NOT NULL DEFAULT 1",
+            "uploaded_by": "TEXT",
+            "approved_by": "TEXT",
+        }
+        for column, definition in project_file_migrations.items():
+            if column not in project_file_columns:
+                connection.execute(
+                    f"ALTER TABLE project_files ADD COLUMN {column} {definition}"
+                )
+        clash_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(clash_issues)").fetchall()
+        }
+        if "last_run_id" not in clash_columns:
+            connection.execute("ALTER TABLE clash_issues ADD COLUMN last_run_id TEXT")
+        selection_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(viewer_selections)").fetchall()
+        }
+        if "cde_state" not in selection_columns:
+            connection.execute("ALTER TABLE viewer_selections ADD COLUMN cde_state TEXT")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO model_slots(
+                project_id, discipline, cde_state, path, original_filename,
+                generation, source_state, created_by_role, updated_at
+            )
+            SELECT project_id, kind, 'WIP', path, original_filename,
+                   revision_number, NULL, uploaded_by, updated_at
+            FROM project_files
+            WHERE kind IN ('ARC', 'STR', 'MEP')
+            """
+        )
         # Translate the exact application-generated legacy error prefix while
         # preserving user-authored messages in their original research language.
         connection.execute(
@@ -214,18 +295,32 @@ def upsert_project_file(
     kind: str,
     path: Path,
     original_filename: str,
+    uploaded_by: str | None = None,
 ) -> None:
     with closing(connect(db_path)) as connection, connection:
         connection.execute(
             """
-            INSERT INTO project_files(project_id, kind, path, original_filename, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO project_files(
+                project_id, kind, path, original_filename, revision_number,
+                uploaded_by, approved_by, updated_at
+            )
+            VALUES (?, ?, ?, ?, 1, ?, NULL, ?)
             ON CONFLICT(project_id, kind) DO UPDATE SET
                 path=excluded.path,
                 original_filename=excluded.original_filename,
+                revision_number=project_files.revision_number + 1,
+                uploaded_by=excluded.uploaded_by,
+                approved_by=NULL,
                 updated_at=excluded.updated_at
             """,
-            (project_id, kind, str(path.resolve()), original_filename, now()),
+            (
+                project_id,
+                kind,
+                str(path.resolve()),
+                original_filename,
+                uploaded_by,
+                now(),
+            ),
         )
 
 
@@ -235,6 +330,140 @@ def project_files(db_path: Path, project_id: int) -> dict[str, dict[str, Any]]:
             "SELECT * FROM project_files WHERE project_id = ?", (project_id,)
         ).fetchall()
     return {row["kind"]: dict(row) for row in rows}
+
+
+def update_project_file_path(
+    db_path: Path, project_id: int, kind: str, path: Path
+) -> None:
+    with closing(connect(db_path)) as connection, connection:
+        connection.execute(
+            "UPDATE project_files SET path=? WHERE project_id=? AND kind=?",
+            (str(path.resolve()), project_id, kind),
+        )
+
+
+def _discipline_value(discipline: str) -> str:
+    value = discipline.strip().upper()
+    if value not in {"ARC", "STR", "MEP"}:
+        raise ValueError("discipline must be ARC, STR, or MEP")
+    return value
+
+
+def _state_value(state: CDEState | str) -> str:
+    if isinstance(state, CDEState):
+        return state.value
+    value = state.strip()
+    for candidate in CDEState:
+        if candidate.value.lower() == value.lower():
+            return candidate.value
+    raise ValueError("cde_state must be WIP, Shared, Published, or Archived")
+
+
+def upsert_model_slot(
+    db_path: Path,
+    project_id: int,
+    discipline: str,
+    cde_state: CDEState | str,
+    path: Path,
+    original_filename: str,
+    created_by_role: str | None = None,
+    source_state: CDEState | str | None = None,
+) -> dict[str, Any]:
+    discipline_value = _discipline_value(discipline)
+    state_value = _state_value(cde_state)
+    source_value = _state_value(source_state) if source_state is not None else None
+    timestamp = now()
+    with closing(connect(db_path)) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO model_slots(
+                project_id, discipline, cde_state, path, original_filename,
+                generation, source_state, created_by_role, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(project_id, discipline, cde_state) DO UPDATE SET
+                path=excluded.path,
+                original_filename=excluded.original_filename,
+                generation=model_slots.generation + 1,
+                source_state=excluded.source_state,
+                created_by_role=excluded.created_by_role,
+                updated_at=excluded.updated_at
+            """,
+            (
+                project_id,
+                discipline_value,
+                state_value,
+                str(path.resolve()),
+                original_filename,
+                source_value,
+                created_by_role,
+                timestamp,
+            ),
+        )
+        row = connection.execute(
+            """
+            SELECT * FROM model_slots
+            WHERE project_id=? AND discipline=? AND cde_state=?
+            """,
+            (project_id, discipline_value, state_value),
+        ).fetchone()
+    return dict(row)
+
+
+def get_model_slot(
+    db_path: Path,
+    project_id: int,
+    discipline: str,
+    cde_state: CDEState | str,
+) -> dict[str, Any] | None:
+    with closing(connect(db_path)) as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM model_slots
+            WHERE project_id=? AND discipline=? AND cde_state=?
+            """,
+            (project_id, _discipline_value(discipline), _state_value(cde_state)),
+        ).fetchone()
+    return _dict(row)
+
+
+def update_model_slot_path(
+    db_path: Path,
+    project_id: int,
+    discipline: str,
+    cde_state: CDEState | str,
+    path: Path,
+) -> None:
+    with closing(connect(db_path)) as connection, connection:
+        cursor = connection.execute(
+            """
+            UPDATE model_slots SET path=?
+            WHERE project_id=? AND discipline=? AND cde_state=?
+            """,
+            (
+                str(path.resolve()),
+                project_id,
+                _discipline_value(discipline),
+                _state_value(cde_state),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("model slot was not found")
+
+
+def model_slots(
+    db_path: Path,
+    project_id: int,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM model_slots
+            WHERE project_id=?
+            ORDER BY discipline, cde_state
+            """,
+            (project_id,),
+        ).fetchall()
+    return {(row["discipline"], row["cde_state"]): dict(row) for row in rows}
 
 
 def ensure_conversation(
@@ -317,7 +546,7 @@ def list_role_context_messages(
 def get_system_prompt(
     db_path: Path,
     project_id: int,
-    identity: Identity,
+    identity: Identity | ProjectRole,
     default: str,
 ) -> str:
     with closing(connect(db_path)) as connection:
@@ -334,7 +563,7 @@ def get_system_prompt(
 def set_system_prompt(
     db_path: Path,
     project_id: int,
-    identity: Identity,
+    identity: Identity | ProjectRole,
     system_prompt: str,
 ) -> None:
     with closing(connect(db_path)) as connection, connection:
@@ -401,6 +630,91 @@ def list_audit_events(
     return result
 
 
+def create_notification(
+    db_path: Path,
+    project_id: int,
+    recipient_key: str,
+    notification_type: str,
+    title: str,
+    payload: dict[str, Any] | None = None,
+    source_id: str | None = None,
+) -> str:
+    notification_id = uuid4().hex
+    with closing(connect(db_path)) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO notifications(
+                id, project_id, recipient_key, notification_type, title,
+                payload_json, source_id, created_at, read_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                notification_id,
+                project_id,
+                recipient_key.strip(),
+                notification_type.strip(),
+                title.strip(),
+                json.dumps(payload or {}, ensure_ascii=False, default=str),
+                source_id,
+                now(),
+            ),
+        )
+    return notification_id
+
+
+def list_notifications(
+    db_path: Path,
+    project_id: int,
+    recipient_key: str,
+    unread_only: bool = False,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    query = "SELECT * FROM notifications WHERE project_id=? AND recipient_key=?"
+    parameters: list[Any] = [project_id, recipient_key]
+    if unread_only:
+        query += " AND read_at IS NULL"
+    query += " ORDER BY created_at DESC LIMIT ?"
+    parameters.append(max(1, int(limit)))
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(query, parameters).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json"))
+        result.append(item)
+    return result
+
+
+def unread_notification_counts(db_path: Path, project_id: int) -> dict[str, int]:
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT recipient_key, COUNT(*) AS unread_count
+            FROM notifications
+            WHERE project_id=? AND read_at IS NULL
+            GROUP BY recipient_key
+            """,
+            (project_id,),
+        ).fetchall()
+    return {str(row["recipient_key"]): int(row["unread_count"]) for row in rows}
+
+
+def mark_notification_read(
+    db_path: Path,
+    project_id: int,
+    notification_id: str,
+) -> bool:
+    with closing(connect(db_path)) as connection, connection:
+        cursor = connection.execute(
+            """
+            UPDATE notifications SET read_at=COALESCE(read_at, ?)
+            WHERE id=? AND project_id=?
+            """,
+            (now(), notification_id, project_id),
+        )
+    return cursor.rowcount == 1
+
+
 def set_selection(
     db_path: Path,
     project_id: int,
@@ -410,15 +724,18 @@ def set_selection(
     ifc_type: str | None,
     global_id: str | None,
     name: str | None,
+    cde_state: CDEState | str | None = None,
 ) -> None:
     with closing(connect(db_path)) as connection, connection:
         connection.execute(
             """
             INSERT INTO viewer_selections(
-                project_id, identity, model_kind, step_id, ifc_type, global_id, name, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                project_id, identity, model_kind, cde_state, step_id, ifc_type,
+                global_id, name, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, identity) DO UPDATE SET
-                model_kind=excluded.model_kind, step_id=excluded.step_id,
+                model_kind=excluded.model_kind, cde_state=excluded.cde_state,
+                step_id=excluded.step_id,
                 ifc_type=excluded.ifc_type, global_id=excluded.global_id,
                 name=excluded.name, updated_at=excluded.updated_at
             """,
@@ -426,6 +743,7 @@ def set_selection(
                 project_id,
                 identity.value,
                 model_kind,
+                _state_value(cde_state) if cde_state is not None else None,
                 step_id,
                 ifc_type,
                 global_id,
@@ -637,6 +955,57 @@ def fail_task(db_path: Path, task_id: str, error: str) -> None:
         if cursor.rowcount != 1:
             raise ValueError(f"Task {task_id} cannot be marked failed")
 
+def create_clash_run(
+    db_path: Path,
+    project_id: int,
+    models: list[dict[str, Any]],
+    pair_counts: dict[str, int],
+    parameters: dict[str, Any],
+    created_by_role: str | None,
+) -> str:
+    run_id = uuid4().hex
+    with closing(connect(db_path)) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO clash_runs(
+                id, project_id, models_json, pair_counts_json, parameters_json,
+                created_by_role, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                project_id,
+                json.dumps(models, ensure_ascii=False, default=str),
+                json.dumps(pair_counts, ensure_ascii=False, default=str),
+                json.dumps(parameters, ensure_ascii=False, default=str),
+                created_by_role,
+                now(),
+            ),
+        )
+    return run_id
+
+
+def list_clash_runs(
+    db_path: Path, project_id: int, limit: int = 50
+) -> list[dict[str, Any]]:
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM clash_runs
+            WHERE project_id=? ORDER BY created_at DESC LIMIT ?
+            """,
+            (project_id, max(1, int(limit))),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["models"] = json.loads(item.pop("models_json"))
+        item["pair_counts"] = json.loads(item.pop("pair_counts_json"))
+        item["parameters"] = json.loads(item.pop("parameters_json"))
+        result.append(item)
+    return result
+
+
 def _clash_element_key(model: str, element: dict[str, Any]) -> str:
     identifier = element.get("global_id") or f"#{element.get('step_id')}"
     return f"{model}:{identifier}"
@@ -647,6 +1016,7 @@ def upsert_clash_issues(
     project_id: int,
     clashes: list[dict[str, Any]],
     source_task_id: str | None = None,
+    last_run_id: str | None = None,
 ) -> list[str]:
     issue_ids = []
     timestamp = now()
@@ -673,9 +1043,9 @@ def upsert_clash_issues(
                 INSERT INTO clash_issues(
                     id, project_id, fingerprint, title, model_a, model_b,
                     element_a_json, element_b_json, details_json, status,
-                    assigned_to, source_task_id, resolution_task_id,
+                    assigned_to, source_task_id, resolution_task_id, last_run_id,
                     created_at, updated_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, NULL, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, NULL, ?, ?, ?, ?)
                 ON CONFLICT(project_id, fingerprint) DO UPDATE SET
                     title=excluded.title,
                     element_a_json=excluded.element_a_json,
@@ -686,6 +1056,7 @@ def upsert_clash_issues(
                         ELSE clash_issues.status
                     END,
                     source_task_id=COALESCE(excluded.source_task_id, source_task_id),
+                    last_run_id=COALESCE(excluded.last_run_id, last_run_id),
                     updated_at=excluded.updated_at,
                     last_seen_at=excluded.last_seen_at
                 """,
@@ -700,6 +1071,7 @@ def upsert_clash_issues(
                     json.dumps(element_b, ensure_ascii=False, default=str),
                     json.dumps(clash, ensure_ascii=False, default=str),
                     source_task_id,
+                    last_run_id,
                     timestamp,
                     timestamp,
                     timestamp,
@@ -763,6 +1135,31 @@ def list_clash_issues(
         issue["details"] = json.loads(issue.pop("details_json"))
         issues.append(issue)
     return issues
+
+
+def assign_clash_issues(
+    db_path: Path,
+    project_id: int,
+    issue_ids: list[str],
+    assigned_to: str,
+) -> int:
+    normalized_ids = list(dict.fromkeys(item.strip() for item in issue_ids if item.strip()))
+    if not normalized_ids:
+        raise ValueError("issue_ids cannot be empty")
+    discipline = _discipline_value(assigned_to)
+    placeholders = ", ".join("?" for _ in normalized_ids)
+    with closing(connect(db_path)) as connection, connection:
+        cursor = connection.execute(
+            f"""
+            UPDATE clash_issues
+            SET assigned_to=?,
+                status=CASE WHEN status='resolved' THEN status ELSE 'assigned' END,
+                updated_at=?
+            WHERE project_id=? AND id IN ({placeholders})
+            """,
+            [discipline, now(), project_id, *normalized_ids],
+        )
+    return cursor.rowcount
 
 
 def link_clash_issue_task(

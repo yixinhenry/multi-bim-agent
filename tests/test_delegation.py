@@ -146,6 +146,7 @@ def test_coordinator_and_specialist_tool_surfaces_are_separate(
     coordinator = make_manager_context(tmp_path)
     assert set(agent.available_tool_names(coordinator)) == {
         "run_clash_detection",
+        "assign_clash_issues",
         "summarize_project_csv",
         "query_project_csv",
         "analyze_ifc_csv_mapping",
