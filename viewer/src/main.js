@@ -13,6 +13,7 @@ const slots = (params.get("models") || "").split(",").filter(Boolean).map((token
 const status = document.getElementById("status");
 const selection = document.getElementById("selection");
 const legend = document.getElementById("legend");
+const progress = document.getElementById("cde-progress");
 const container = document.getElementById("viewer");
 const colors = { ARC: "#60a5fa", STR: "#f59e0b", MEP: "#10b981" };
 const clashTargets = [params.get("clash_a"), params.get("clash_b")]
@@ -21,6 +22,10 @@ const clashTargets = [params.get("clash_a"), params.get("clash_b")]
     const separator = value.indexOf(":");
     return { kind: value.slice(0, separator), globalId: value.slice(separator + 1) };
   });
+
+progress.innerHTML = ["WIP", "Shared", "Published", "Archived"].map((state) =>
+  `<span class="${state === slots[0]?.state ? "active" : ""}">${state}</span>`
+).join("");
 
 legend.innerHTML = slots.map(({ kind, state }) =>
   `<span><i class="dot" style="background:${colors[kind]}"></i>${kind} · ${state}</span>`
