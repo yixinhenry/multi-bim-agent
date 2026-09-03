@@ -4,6 +4,8 @@ An experimental multi-agent IFC collaboration platform for BIM AI security
 research. A user-facing coordinator enforces user permissions and delegates IFC
 work to isolated ARC, STR, and MEP specialist Agents.
 
+![Multi-BIM Agent Platform](multi-bim-agent-demo.png)
+
 ## Current capabilities
 
 - Current `ARC.ifc`, `STR.ifc`, and `MEP.ifc` files per project
